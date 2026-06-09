@@ -5,7 +5,7 @@ Local NOC-style network monitoring console.
 ## Run
 
 ```powershell
-& 'C:\Users\user\.cache\codex-runtimes\codex-primary-runtime\dependencies\python\python.exe' server.py
+& python.exe' server.py
 ```
 
 Open:
