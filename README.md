@@ -5,7 +5,7 @@ Local NOC-style network monitoring console.
 ## Run
 
 ```powershell
-& python.exe' server.py
+& python.exe server.py
 ```
 
 Open:
