@@ -4,11 +4,17 @@ const state = {
   activeView: "dashboard",
   selectedDeviceId: null,
   selectedSensorId: null,
+  pendingDeviceGroup: "",
   devices: [],
+  groups: [],
   sensors: [],
   events: [],
   summary: null,
   draggingNode: null,
+  snmpDiscovery: null,
+  interfaceDiscovery: null,
+  sensorSamples: {},
+  sensorSamplesLoading: {},
 };
 
 const emptySummary = {
@@ -28,6 +34,17 @@ const statusLabels = {
   unknown: "Unknown",
   paused: "Paused",
 };
+
+const chartPlot = {
+  left: 82,
+  right: 744,
+  top: 36,
+  bottom: 268,
+};
+chartPlot.width = chartPlot.right - chartPlot.left;
+chartPlot.height = chartPlot.bottom - chartPlot.top;
+const chartTimeStepMs = 30 * 1000;
+const chartVisibleWindowMs = 10 * 60 * 1000;
 
 const snmpOidGuide = [
   {
@@ -105,21 +122,24 @@ async function loadData() {
   render();
 
   try {
-    const [summary, devices, sensors, events] = await Promise.all([
+    const [summary, devices, groups, sensors, events] = await Promise.all([
       fetchJson("/api/summary"),
       fetchJson("/api/devices"),
+      fetchJson("/api/groups"),
       fetchJson("/api/sensors"),
       fetchJson("/api/events"),
     ]);
 
     state.summary = normalizeSummary(summary);
     state.devices = normalizeList(devices);
+    state.groups = normalizeList(groups);
     state.sensors = normalizeList(sensors);
     state.events = normalizeList(events);
     state.apiOnline = true;
   } catch {
     state.summary = emptySummary;
     state.devices = [];
+    state.groups = [];
     state.sensors = [];
     state.events = [];
     state.apiOnline = false;
@@ -215,6 +235,7 @@ function render() {
       </div>
     </div>
     ${renderDeviceModal()}
+    ${renderGroupModal()}
     ${renderSensorModal()}
   `;
   bindEvents();
@@ -242,7 +263,7 @@ function renderSidebar() {
       <section class="tree-panel">
         <div class="section-label">
           <span>Monitoring Tree</span>
-          <button class="mini-button" data-action="tree-add" aria-label="Add from tree">${icon("plus")}</button>
+          <button class="mini-button" data-action="open-group-modal" aria-label="Add group">${icon("plus")}</button>
         </div>
         <div class="tree-scroll">
           ${groups.length ? groups.map(renderTreeGroup).join("") : renderTreeEmpty()}
@@ -427,24 +448,28 @@ function renderDeviceDetail() {
   const sensors = state.sensors.filter((sensor) => String(sensor.deviceId) === String(device.id));
 
   return `
-    <main class="single-view detail-grid">
-      <section class="panel identity-panel">
-        <div class="detail-title">
+    <main class="single-view device-detail-view">
+      <section class="panel identity-panel device-summary-panel">
+        <div class="detail-title device-summary-head">
           <div>
             <h2>${escapeHtml(device.name || device.host)}</h2>
             <p>${escapeHtml(device.host || "")}</p>
           </div>
           ${statusBadge(device.status)}
         </div>
-        <form class="group-editor" data-form="device-group" data-device-id="${device.id}">
-          <label>Group<input name="group" type="text" value="${escapeAttribute(device.group || "Unassigned")}" /></label>
-          <button class="ghost-button" type="submit">Save Group</button>
-        </form>
-        ${detailRow("SNMP", device.snmpEnabled ? "Enabled" : "Disabled")}
-        ${detailRow("SNMP Port", device.snmpPort || 161)}
-        ${detailRow("Notes", device.notes || "-")}
-        <div class="danger-zone">
-          <button class="mini-action danger" data-action="delete-device" data-delete-device-id="${device.id}">${icon("trash")} Delete Device</button>
+        <div class="device-summary-body">
+          <form class="group-editor" data-form="device-group" data-device-id="${device.id}">
+            <label>Group<input name="group" type="text" value="${escapeAttribute(device.group || "Unassigned")}" /></label>
+            <button class="ghost-button" type="submit">Save Group</button>
+          </form>
+          <div class="device-summary-details">
+            ${detailRow("SNMP", device.snmpEnabled ? "Enabled" : "Disabled")}
+            ${detailRow("SNMP Port", device.snmpPort || 161)}
+            ${detailRow("Notes", device.notes || "-")}
+          </div>
+          <div class="danger-zone">
+            <button class="mini-action danger" data-action="delete-device" data-delete-device-id="${device.id}">${icon("trash")} Delete Device</button>
+          </div>
         </div>
       </section>
       <section class="panel">
@@ -455,7 +480,7 @@ function renderDeviceDetail() {
           </div>
           <button class="primary-button" data-action="open-sensor-modal" data-device-id="${device.id}">${icon("plus")} Sensor</button>
         </div>
-        ${renderSensorTable(sensors)}
+        ${renderSensorTable(sensors, { showDevice: false })}
       </section>
     </main>
   `;
@@ -466,6 +491,7 @@ function renderSensorDetail() {
   if (!sensor) {
     return `<main class="single-view">${emptyState("Sensor not found", "The selected sensor is not available from the API.")}</main>`;
   }
+  const samples = state.sensorSamples[String(sensor.id)] || [];
 
   return `
     <main class="single-view detail-grid">
@@ -479,22 +505,231 @@ function renderSensorDetail() {
         </div>
         ${detailRow("Last Value", sensor.lastValue || "-")}
         ${detailRow("Interval", `${sensor.interval || 30}s`)}
+        ${detailRow("Device", deviceName(sensor.deviceId))}
         ${detailRow("Unit", sensor.unit || "-")}
+        ${sensor.type === "snmp_traffic" ? detailRow("Interface", sensor.config?.interfaceName || sensor.config?.index || "-") : ""}
+        ${sensor.type === "snmp_traffic" ? detailRow("Description", sensor.config?.interfaceDescription || "-") : ""}
+        ${sensor.type === "snmp_traffic" ? detailRow("Interface Speed", formatRate(sensor.config?.interfaceSpeed || 0)) : ""}
+        ${sensor.type === "snmp_traffic" ? detailRow("Speed OID", sensor.config?.speedOid || "-") : ""}
+        ${sensor.type === "snmp_traffic" ? detailRow("Inbound OID", sensor.config?.inOid || "-") : ""}
+        ${sensor.type === "snmp_traffic" ? detailRow("Outbound OID", sensor.config?.outOid || "-") : ""}
         ${detailRow("Last Check", sensor.lastCheck || "-")}
       </section>
       <section class="panel chart-panel">
         <div class="panel-head">
           <div>
             <h2>Measurement History</h2>
-            <p>Backend samples will render here</p>
+            <p>${sensor.type === "snmp_traffic" ? "Inbound and outbound interface rate" : "Recent sensor samples"}</p>
           </div>
+          <button class="ghost-button" data-action="check-sensor" data-check-sensor-id="${sensor.id}">${icon("play")} Check</button>
         </div>
-        <div class="empty-chart">
-          <span>No samples</span>
-        </div>
+        ${renderSensorChart(sensor, samples)}
       </section>
     </main>
   `;
+}
+
+function renderSensorChart(sensor, samples) {
+  if (state.sensorSamplesLoading[String(sensor.id)]) {
+    return `<div class="empty-chart"><span>Loading samples</span></div>`;
+  }
+  if (!samples.length) {
+    return `<div class="empty-chart"><span>No samples yet</span></div>`;
+  }
+
+  if (sensor.type === "snmp_traffic") {
+    const domain = chartDomain(samples);
+    const visibleSamples = chartVisibleSamples(samples, domain);
+    const points = visibleSamples.map((sample) => ({
+      time: sample.createdAt,
+      inBps: Number(sample.meta?.inBps || 0),
+      outBps: Number(sample.meta?.outBps || 0),
+    }));
+    const measuredMax = Math.max(1, ...points.flatMap((item) => [item.inBps, item.outBps]));
+    const interfaceSpeed = Number(sensor.config?.interfaceSpeed || visibleSamples.at(-1)?.meta?.interfaceSpeed || 0);
+    const axisMax = Math.max(1, interfaceSpeed || measuredMax, measuredMax);
+    const scale = chartScale(axisMax, "rate");
+    return `
+      <div class="traffic-chart">
+        <div class="chart-stats">
+          <div><span>Inbound</span><strong>${formatRate(points.at(-1)?.inBps || 0)}</strong></div>
+          <div><span>Outbound</span><strong>${formatRate(points.at(-1)?.outBps || 0)}</strong></div>
+          <div><span>Peak</span><strong>${formatRate(measuredMax)}</strong></div>
+          <div><span>Axis Max</span><strong>${formatRate(axisMax)}</strong></div>
+        </div>
+        <svg viewBox="0 0 780 330" role="img" aria-label="Interface traffic history">
+          ${chartGrid(axisMax, scale, domain)}
+          <polyline class="chart-line in" points="${chartPoints(points.map((item) => item.inBps), axisMax, visibleSamples, domain)}"></polyline>
+          <polyline class="chart-line out" points="${chartPoints(points.map((item) => item.outBps), axisMax, visibleSamples, domain)}"></polyline>
+        </svg>
+        <div class="chart-legend">
+          <span><i class="legend-in"></i>Inbound</span>
+          <span><i class="legend-out"></i>Outbound</span>
+        </div>
+      </div>
+    `;
+  }
+
+  const domain = chartDomain(samples);
+  const visibleSamples = chartVisibleSamples(samples, domain);
+  const values = visibleSamples.map((sample) => Number(sample.valueNumber || 0));
+  const max = Math.max(1, ...values);
+  const scale = chartScale(max, "number", sensor.unit || "");
+  return `
+    <div class="traffic-chart">
+      <div class="chart-stats">
+        <div><span>Current</span><strong>${escapeHtml(visibleSamples.at(-1)?.valueText || "-")}</strong></div>
+        <div><span>Samples</span><strong>${visibleSamples.length}</strong></div>
+        <div><span>Peak</span><strong>${max.toLocaleString()}</strong></div>
+        <div><span>Axis Max</span><strong>${max.toLocaleString()}</strong></div>
+      </div>
+      <svg viewBox="0 0 780 330" role="img" aria-label="Sensor sample history">
+        ${chartGrid(max, scale, domain)}
+        <polyline class="chart-line in" points="${chartPoints(values, max, visibleSamples, domain)}"></polyline>
+      </svg>
+    </div>
+  `;
+}
+
+function chartGrid(max, scale, domain) {
+  const yTicks = [1, 0.75, 0.5, 0.25, 0];
+  const timeTicks = chartTimeTicks(domain);
+  return `
+    <g class="chart-grid">
+      <line x1="${chartPlot.left}" y1="${chartPlot.top}" x2="${chartPlot.left}" y2="${chartPlot.bottom}"></line>
+      <line x1="${chartPlot.left}" y1="${chartPlot.bottom}" x2="${chartPlot.right}" y2="${chartPlot.bottom}"></line>
+      ${timeTicks
+        .map((tick) => `<line x1="${tick.x.toFixed(1)}" y1="${chartPlot.top}" x2="${tick.x.toFixed(1)}" y2="${chartPlot.bottom}"></line>`)
+        .join("")}
+      ${yTicks
+        .map((ratio) => {
+          const y = chartPlot.bottom - ratio * chartPlot.height;
+          return `<line x1="${chartPlot.left}" y1="${y.toFixed(1)}" x2="${chartPlot.right}" y2="${y.toFixed(1)}"></line>`;
+        })
+        .join("")}
+    </g>
+    <g class="chart-axis-labels">
+      ${yTicks
+        .map((ratio) => {
+          const y = chartPlot.bottom - ratio * chartPlot.height;
+          const label = formatAxisValue(max * ratio, scale);
+          return `<text x="${chartPlot.left - 10}" y="${(y + 4).toFixed(1)}" text-anchor="end">${escapeHtml(label)}</text>`;
+        })
+        .join("")}
+      ${timeTicks
+        .map((tick) => `<text class="chart-time-label" x="${tick.x.toFixed(1)}" y="294" text-anchor="middle">${escapeHtml(tick.label)}</text>`)
+        .join("")}
+      <text class="chart-axis-title" x="${chartPlot.left}" y="20" text-anchor="start">${escapeHtml(scale.unit)}</text>
+      <text class="chart-axis-title" x="${((chartPlot.left + chartPlot.right) / 2).toFixed(1)}" y="320" text-anchor="middle">Time</text>
+    </g>
+  `;
+}
+
+function chartPoints(values, max, samples, domain) {
+  return values
+    .map((value, index) => {
+      const time = new Date(samples[index]?.createdAt || "").getTime();
+      const x = chartX(Number.isFinite(time) ? time : domain.start + index * chartTimeStepMs, domain);
+      const y = chartPlot.bottom - (Number(value || 0) / max) * chartPlot.height;
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
+}
+
+function chartDomain(samples) {
+  const times = samples
+    .map((sample) => new Date(sample.createdAt || "").getTime())
+    .filter((time) => Number.isFinite(time));
+  const now = Date.now();
+  const minTime = times.length ? Math.min(...times) : now - chartTimeStepMs;
+  const maxTime = times.length ? Math.max(...times) : now;
+  const rawStart = Math.floor(minTime / chartTimeStepMs) * chartTimeStepMs;
+  let end = Math.ceil(maxTime / chartTimeStepMs) * chartTimeStepMs;
+  let start = Math.max(rawStart, end - chartVisibleWindowMs);
+  if (end <= start) end = start + chartTimeStepMs;
+  return { start, end };
+}
+
+function chartVisibleSamples(samples, domain) {
+  const visible = samples.filter((sample) => {
+    const time = new Date(sample.createdAt || "").getTime();
+    return Number.isFinite(time) && time >= domain.start && time <= domain.end;
+  });
+  return visible.length ? visible : samples.slice(-1);
+}
+
+function chartX(time, domain) {
+  return chartPlot.left + ((time - domain.start) / Math.max(1, domain.end - domain.start)) * chartPlot.width;
+}
+
+function chartTimeTicks(domain) {
+  const ticks = [];
+  for (let time = domain.start; time <= domain.end + 1; time += chartTimeStepMs) {
+    ticks.push({
+      label: formatChartTimeLabel(time),
+      x: chartX(time, domain),
+    });
+  }
+  return ticks;
+}
+
+function chartScale(max, type, unit = "") {
+  if (type === "rate") {
+    const units = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"];
+    let divisor = 1;
+    let selected = units[0];
+    for (const candidate of units) {
+      selected = candidate;
+      if (max / divisor < 1000 || candidate === units.at(-1)) break;
+      divisor *= 1000;
+    }
+    return { divisor, unit: selected };
+  }
+  return { divisor: 1, unit: unit || "value" };
+}
+
+function formatAxisValue(value, scale) {
+  const scaled = Number(value || 0) / scale.divisor;
+  if (Math.abs(scaled) >= 100) return scaled.toFixed(0);
+  if (Math.abs(scaled) >= 10) return scaled.toFixed(1);
+  return scaled.toFixed(2);
+}
+
+function formatTimeLabel(value) {
+  const date = new Date(value || "");
+  if (Number.isNaN(date.getTime())) return "-";
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return `${hours}:${minutes}:${seconds}`;
+}
+
+function formatTableDateTime(value) {
+  const date = new Date(value || "");
+  if (Number.isNaN(date.getTime())) return value || "-";
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  return `${year}-${month}-${day} ${formatTimeLabel(date)}`;
+}
+
+function formatChartTimeLabel(value) {
+  const date = new Date(value || "");
+  if (Number.isNaN(date.getTime())) return "-";
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return `${minutes}:${seconds}`;
+}
+
+function formatRate(value) {
+  const units = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"];
+  let current = Math.max(0, Number(value || 0));
+  let unit = units[0];
+  for (unit of units) {
+    if (current < 1000 || unit === units.at(-1)) break;
+    current /= 1000;
+  }
+  return `${current.toFixed(2)} ${unit}`;
 }
 
 function metricCard(label, value, caption, tone) {
@@ -605,48 +840,71 @@ function renderDeviceTable() {
   `;
 }
 
-function renderSensorTable(sensors) {
+function renderSensorTable(sensors, options = {}) {
   if (!sensors.length) {
     return emptyState("No sensors", "Ping, HTTP, and SNMP readings will appear after the API is connected.");
   }
+  const showDevice = options.showDevice !== false;
 
   return `
-    <div class="data-table-wrap">
-      <table>
-        <thead>
-          <tr>
-            <th>Status</th>
-            <th>Sensor</th>
-            <th>Type</th>
-            <th>Device</th>
-            <th>Value</th>
-            <th>Last Check</th>
-            <th>Actions</th>
-          </tr>
-        </thead>
-        <tbody>
-          ${sensors
-            .map(
-              (sensor) => `
-                <tr data-sensor-id="${sensor.id}">
-                  <td>${statusBadge(sensor.status)}</td>
-                  <td>${escapeHtml(sensor.name || "-")}</td>
-                  <td>${escapeHtml(sensor.type || "-")}</td>
-                  <td>${escapeHtml(deviceName(sensor.deviceId))}</td>
-                  <td>${escapeHtml(sensor.lastValue || "-")}</td>
-                  <td>${escapeHtml(sensor.lastCheck || "-")}</td>
-                  <td>
-                    <div class="row-actions">
-                      <button class="mini-action" data-action="check-sensor" data-check-sensor-id="${sensor.id}">${icon("play")} Check</button>
-                      <button class="mini-action danger" data-action="delete-sensor" data-delete-sensor-id="${sensor.id}">${icon("trash")} Delete</button>
-                    </div>
-                  </td>
-                </tr>
-              `
-            )
-            .join("")}
-        </tbody>
-      </table>
+    <div class="scrollable-table-shell">
+      <div class="table-scroll-top" data-table-scroll-top aria-hidden="true"><div></div></div>
+      <div class="data-table-wrap" data-table-scroll-body>
+        <table class="sensor-table ${showDevice ? "" : "compact-sensor-table"}">
+          <colgroup>
+            <col class="sensor-col-status" />
+            <col class="sensor-col-name" />
+            <col class="sensor-col-type" />
+            ${showDevice ? `<col class="sensor-col-device" />` : ""}
+            <col class="sensor-col-value" />
+            <col class="sensor-col-check" />
+            <col class="sensor-col-actions" />
+          </colgroup>
+          <thead>
+            <tr>
+              <th>Status</th>
+              <th>Sensor</th>
+              <th>Type</th>
+              ${showDevice ? "<th>Device</th>" : ""}
+              <th>Value</th>
+              <th>Last Check</th>
+              <th>Actions</th>
+            </tr>
+          </thead>
+          <tbody>
+            ${sensors
+              .map(
+                (sensor) => `
+                  <tr data-sensor-id="${sensor.id}">
+                    <td>${statusBadge(sensor.status)}</td>
+                    <td>${renderSensorNameCell(sensor)}</td>
+                    <td>${escapeHtml(sensor.type || "-")}</td>
+                    ${showDevice ? `<td>${escapeHtml(deviceName(sensor.deviceId))}</td>` : ""}
+                    <td>${escapeHtml(sensor.lastValue || "-")}</td>
+                    <td title="${escapeAttribute(sensor.lastCheck || "-")}">${escapeHtml(formatTableDateTime(sensor.lastCheck))}</td>
+                    <td>
+                      <div class="row-actions">
+                        <button class="mini-action" data-action="check-sensor" data-check-sensor-id="${sensor.id}">${icon("play")} Check</button>
+                        <button class="mini-action danger" data-action="delete-sensor" data-delete-sensor-id="${sensor.id}">${icon("trash")} Delete</button>
+                      </div>
+                    </td>
+                  </tr>
+                `
+              )
+              .join("")}
+          </tbody>
+        </table>
+      </div>
+    </div>
+  `;
+}
+
+function renderSensorNameCell(sensor) {
+  const description = sensor.type === "snmp_traffic" ? sensor.config?.interfaceDescription || "" : "";
+  return `
+    <div class="sensor-name-cell">
+      <strong>${escapeHtml(sensor.name || "-")}</strong>
+      ${description ? `<small>${escapeHtml(description)}</small>` : ""}
     </div>
   `;
 }
@@ -682,6 +940,7 @@ function renderTreeGroup(group) {
         <span class="status-dot ${group.status}"></span>
         <strong>${escapeHtml(group.name)}</strong>
         <small>${group.devices.length}</small>
+        <span class="tree-group-action add" data-action="open-device-modal" data-group-name="${escapeAttribute(group.name)}" aria-label="Add device to group">${icon("plus")}</span>
         <span class="tree-group-action" data-action="delete-group" data-delete-group-name="${escapeAttribute(group.name)}" aria-label="Delete group">${icon("trash")}</span>
       </button>
       ${group.devices
@@ -749,13 +1008,35 @@ function renderDeviceModal() {
         <div class="form-grid">
           <label>Name<input name="name" type="text" placeholder="Core Switch" required /></label>
           <label>Host<input name="host" type="text" placeholder="192.168.1.1" required /></label>
-          <label>Group<input name="group" type="text" placeholder="Core Network" /></label>
+          <label>Group<input name="group" type="text" placeholder="Core Network" value="${escapeAttribute(state.pendingDeviceGroup)}" /></label>
           <label>SNMP Port<input name="snmpPort" type="number" value="161" /></label>
           <label class="wide check-label"><input name="snmpEnabled" type="checkbox" /> Enable SNMP v2c for this device</label>
           <label class="wide">SNMP v2c Community<input name="snmpCommunity" type="password" placeholder="public" /></label>
           <label class="wide">Notes<textarea name="notes" placeholder="Location, model, owner, or maintenance notes"></textarea></label>
         </div>
         <div class="modal-note" data-form-message="device">Device will be saved to local SQLite.</div>
+        <div class="modal-actions">
+          <button class="ghost-button" type="button" data-action="close-dialog">Cancel</button>
+          <button class="primary-button" type="submit">Save</button>
+        </div>
+      </form>
+    </dialog>
+  `;
+}
+
+function renderGroupModal() {
+  return `
+    <dialog id="group-modal">
+      <form class="modal-card compact-modal" data-form="group">
+        <div class="modal-head">
+          <div>
+            <h2>Add Group</h2>
+            <p>Create an empty monitoring group.</p>
+          </div>
+          <button class="icon-button" type="button" data-action="close-dialog" aria-label="Close">${icon("close")}</button>
+        </div>
+        <label>Group Name<input name="name" type="text" placeholder="Networks" required /></label>
+        <div class="modal-note" data-form-message="group">Groups can exist even before devices are added.</div>
         <div class="modal-actions">
           <button class="ghost-button" type="button" data-action="close-dialog">Cancel</button>
           <button class="primary-button" type="submit">Save</button>
@@ -783,22 +1064,47 @@ function renderSensorModal() {
             <div class="segmented-control">
               <label><input type="radio" name="type" value="icmp" checked /> <span>ICMP Ping</span></label>
               <label><input type="radio" name="type" value="snmp" /> <span>SNMP v2c GET</span></label>
+              <label><input type="radio" name="type" value="snmp_traffic" /> <span>Interface Traffic</span></label>
             </div>
           </div>
           <label>Name<input name="name" type="text" placeholder="ICMP Ping" /></label>
           <label>Interval Seconds<input name="interval" type="number" value="30" min="10" /></label>
           <div class="snmp-fields" data-snmp-fields hidden>
-            <label>SNMP OID<input name="oid" type="text" value="1.3.6.1.2.1.1.3.0" /></label>
+            <label data-snmp-get-only>SNMP OID<input name="oid" type="text" value="1.3.6.1.2.1.1.3.0" /></label>
             <label>Community<input name="community" type="password" placeholder="Use device community" /></label>
             <label>Port<input name="port" type="number" value="${device?.snmpPort || 161}" /></label>
-            <label>Unit<input name="unit" type="text" placeholder="ticks, %, ms" /></label>
-            <section class="oid-guide">
+            <label data-snmp-get-only>Unit<input name="unit" type="text" placeholder="ticks, %, ms" /></label>
+            <section class="oid-guide" data-snmp-get-only>
               <div class="oid-guide-head">
                 <strong>Common SNMP OIDs</strong>
                 <span>Click Use to fill the sensor fields.</span>
               </div>
               <div class="oid-guide-list">
                 ${snmpOidGuide.map(renderOidGuideItem).join("")}
+              </div>
+            </section>
+            <section class="snmp-discovery" data-snmp-discovery data-snmp-get-only>
+              <div class="snmp-discovery-head">
+                <div>
+                  <strong>SNMP Walk Discovery</strong>
+                  <span>Use the OID above as a base, discover indexed rows, then create one sensor per row.</span>
+                </div>
+                <button class="mini-action" type="button" data-action="scan-snmp-walk">${icon("radar")} Scan</button>
+              </div>
+              <div class="snmp-discovery-results" data-snmp-discovery-results>
+                <p>Example: walk <code>1.3.6.1.2.1.2.2.1.2</code> to discover interface names and indexes.</p>
+              </div>
+            </section>
+            <section class="snmp-discovery traffic-discovery" data-traffic-discovery hidden>
+              <div class="snmp-discovery-head">
+                <div>
+                  <strong>Interface Traffic Discovery</strong>
+                  <span>Discover ports, pair each index with inbound/outbound HC octet counters, and create traffic sensors.</span>
+                </div>
+                <button class="mini-action" type="button" data-action="scan-interface-traffic">${icon("radar")} Scan Ports</button>
+              </div>
+              <div class="snmp-discovery-results" data-traffic-discovery-results>
+                <p>Uses <code>1.3.6.1.2.1.2.2.1.2</code> for port names, then maps inbound <code>1.3.6.1.2.1.31.1.1.1.6.X</code> and outbound <code>1.3.6.1.2.1.31.1.1.1.10.X</code>.</p>
               </div>
             </section>
           </div>
@@ -844,6 +1150,10 @@ function sensorTypeButton(label, text) {
 
 function groupDevices() {
   const map = new Map();
+  state.groups.forEach((group) => {
+    const name = group.name || "Unassigned";
+    if (!map.has(name)) map.set(name, []);
+  });
   state.devices.forEach((device) => {
     const group = device.group || "Unassigned";
     if (!map.has(group)) map.set(group, []);
@@ -921,7 +1231,12 @@ function bindEvents() {
   });
 
   document.querySelectorAll("[data-action='open-device-modal']").forEach((button) => {
-    button.addEventListener("click", () => document.querySelector("#device-modal")?.showModal());
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      state.pendingDeviceGroup = button.dataset.groupName || "";
+      render();
+      document.querySelector("#device-modal")?.showModal();
+    });
   });
 
   document.querySelectorAll("[data-action='open-sensor-modal']").forEach((button) => {
@@ -931,21 +1246,15 @@ function bindEvents() {
       if (!deviceId) return;
       state.selectedDeviceId = deviceId;
       state.activeView = "device-detail";
+      state.snmpDiscovery = null;
+      state.interfaceDiscovery = null;
       render();
       document.querySelector("#sensor-modal")?.showModal();
     });
   });
 
-  document.querySelectorAll("[data-action='tree-add']").forEach((button) => {
-    button.addEventListener("click", () => {
-      if (state.selectedDeviceId) {
-        state.activeView = "device-detail";
-        render();
-        document.querySelector("#sensor-modal")?.showModal();
-      } else {
-        document.querySelector("#device-modal")?.showModal();
-      }
-    });
+  document.querySelectorAll("[data-action='open-group-modal']").forEach((button) => {
+    button.addEventListener("click", () => document.querySelector("#group-modal")?.showModal());
   });
 
   document.querySelectorAll("[data-action='close-dialog']").forEach((button) => {
@@ -984,11 +1293,28 @@ function bindEvents() {
     button.addEventListener("click", () => applyOidGuide(button));
   });
 
+  document.querySelectorAll("[data-action='scan-snmp-walk']").forEach((button) => {
+    button.addEventListener("click", async () => scanSnmpWalk(button.closest("form")));
+  });
+
+  document.querySelectorAll("[data-action='create-discovered-sensors']").forEach((button) => {
+    button.addEventListener("click", async () => createDiscoveredSnmpSensors(button.closest("form")));
+  });
+
+  document.querySelectorAll("[data-action='scan-interface-traffic']").forEach((button) => {
+    button.addEventListener("click", async () => scanInterfaceTraffic(button.closest("form")));
+  });
+
+  document.querySelectorAll("[data-action='create-traffic-sensors']").forEach((button) => {
+    button.addEventListener("click", async () => createTrafficSensors(button.closest("form")));
+  });
+
   document.querySelectorAll("[data-action='check-now']").forEach((button) => {
     button.addEventListener("click", checkAllSensors);
   });
 
   document.querySelector("[data-form='device']")?.addEventListener("submit", saveDevice);
+  document.querySelector("[data-form='group']")?.addEventListener("submit", saveGroup);
   document.querySelector("[data-form='device-group']")?.addEventListener("submit", saveDeviceGroup);
   const sensorForm = document.querySelector("[data-form='sensor']");
   sensorForm?.addEventListener("submit", saveSensor);
@@ -996,6 +1322,41 @@ function bindEvents() {
     input.addEventListener("change", () => updateSensorTypeFields(sensorForm));
   });
   if (sensorForm) updateSensorTypeFields(sensorForm);
+  syncTableScrollbars();
+  if (state.activeView === "sensor-detail" && state.selectedSensorId) {
+    loadSensorSamples(state.selectedSensorId);
+  }
+}
+
+function syncTableScrollbars() {
+  document.querySelectorAll(".scrollable-table-shell").forEach((shell) => {
+    const top = shell.querySelector("[data-table-scroll-top]");
+    const topInner = top?.firstElementChild;
+    const body = shell.querySelector("[data-table-scroll-body]");
+    const table = body?.querySelector("table");
+    if (!top || !topInner || !body || !table) return;
+
+    const update = () => {
+      topInner.style.width = `${table.scrollWidth}px`;
+      top.hidden = body.scrollWidth <= body.clientWidth + 1;
+    };
+
+    let syncing = false;
+    top.addEventListener("scroll", () => {
+      if (syncing) return;
+      syncing = true;
+      body.scrollLeft = top.scrollLeft;
+      syncing = false;
+    });
+    body.addEventListener("scroll", () => {
+      if (syncing) return;
+      syncing = true;
+      top.scrollLeft = body.scrollLeft;
+      syncing = false;
+    });
+    update();
+    requestAnimationFrame(update);
+  });
 }
 
 function startTopologyDrag(event) {
@@ -1069,13 +1430,26 @@ function updateSensorTypeFields(form) {
   const nameInput = form.querySelector("input[name='name']");
   const message = form.querySelector("[data-form-message='sensor']");
   const isSnmp = type === "snmp";
+  const isTraffic = type === "snmp_traffic";
 
-  if (snmpFields) snmpFields.hidden = !isSnmp;
-  if (nameInput) nameInput.placeholder = isSnmp ? "SNMP Uptime" : "ICMP Ping";
+  if (snmpFields) snmpFields.hidden = !(isSnmp || isTraffic);
+  form.querySelectorAll("[data-snmp-get-only]").forEach((element) => {
+    element.hidden = !isSnmp;
+  });
+  form.querySelectorAll("[data-traffic-discovery]").forEach((element) => {
+    element.hidden = !isTraffic;
+  });
+  if (nameInput) {
+    nameInput.placeholder = isTraffic ? "Traffic" : isSnmp ? "SNMP Uptime" : "ICMP Ping";
+  }
   if (message) {
-    message.textContent = isSnmp
-      ? "Enter the SNMP v2c OID, community, and UDP port for this device."
-      : "ICMP uses the selected device host. No SNMP parameters are required.";
+    if (isTraffic) {
+      message.textContent = "Scan interfaces and create one inbound/outbound traffic sensor per port.";
+    } else {
+      message.textContent = isSnmp
+        ? "Enter the SNMP v2c OID, community, and UDP port for this device."
+        : "ICMP uses the selected device host. No SNMP parameters are required.";
+    }
   }
 }
 
@@ -1097,6 +1471,217 @@ function applyOidGuide(button) {
   }
 }
 
+function renderSnmpDiscoveryResults(items) {
+  if (!items.length) {
+    return `<p>No rows found under this OID. Check the base OID, community, and SNMP access.</p>`;
+  }
+
+  const visibleItems = items.slice(0, 40);
+  const hiddenCount = Math.max(0, items.length - visibleItems.length);
+  return `
+    <p>Found ${items.length} indexed row(s). These will be created as individual SNMP GET sensors.</p>
+    <div class="snmp-discovery-list">
+      ${visibleItems
+        .map(
+          (item) => `
+            <div class="snmp-discovery-row">
+              <strong>#${escapeHtml(item.index || "-")}</strong>
+              <span>${escapeHtml(item.value || "-")}</span>
+              <code>${escapeHtml(item.oid || "")}</code>
+            </div>
+          `
+        )
+        .join("")}
+    </div>
+    ${hiddenCount ? `<p>${hiddenCount} more row(s) are hidden from preview but will still be created.</p>` : ""}
+    <div class="snmp-discovery-actions">
+      <button class="primary-button" type="button" data-action="create-discovered-sensors">${icon("plus")} Create ${items.length} Sensors</button>
+    </div>
+  `;
+}
+
+function renderTrafficDiscoveryResults(items) {
+  if (!items.length) {
+    return `<p>No interfaces found. Check SNMP access or try a device that exposes IF-MIB.</p>`;
+  }
+
+  const visibleItems = items.slice(0, 40);
+  const hiddenCount = Math.max(0, items.length - visibleItems.length);
+  return `
+    <p>Found ${items.length} interface(s). Each one will become a traffic sensor with inbound and outbound counters.</p>
+    <div class="traffic-discovery-list">
+      ${visibleItems
+        .map(
+          (item) => `
+            <div class="traffic-discovery-row">
+              <strong>#${escapeHtml(item.index || "-")}</strong>
+              <span>
+                <b>${escapeHtml(item.name || "-")}</b>
+                <small>${escapeHtml([item.description, item.speedBps ? `Speed ${formatRate(item.speedBps)}` : ""].filter(Boolean).join(" · ") || "No description")}</small>
+              </span>
+              <code>SPEED ${escapeHtml(item.speedOid || "")}</code>
+              <code>IN ${escapeHtml(item.inOid || "")}</code>
+              <code>OUT ${escapeHtml(item.outOid || "")}</code>
+            </div>
+          `
+        )
+        .join("")}
+    </div>
+    ${hiddenCount ? `<p>${hiddenCount} more interface(s) are hidden from preview but will still be created.</p>` : ""}
+    <div class="snmp-discovery-actions">
+      <button class="primary-button" type="button" data-action="create-traffic-sensors">${icon("plus")} Create ${items.length} Traffic Sensors</button>
+    </div>
+  `;
+}
+
+async function scanSnmpWalk(form) {
+  if (!form) return;
+  const message = form.querySelector("[data-form-message='sensor']");
+  const results = form.querySelector("[data-snmp-discovery-results]");
+  const data = new FormData(form);
+  const deviceId = state.selectedDeviceId;
+  try {
+    if (!deviceId) throw new Error("Select a device from the monitoring tree first.");
+    const baseOid = String(data.get("oid") || "").trim();
+    if (!baseOid) throw new Error("Enter a discovery base OID first.");
+    state.snmpDiscovery = null;
+    if (message) message.textContent = `Walking ${baseOid}...`;
+    if (results) results.innerHTML = `<p>Scanning SNMP table. This may take a few seconds.</p>`;
+    const payload = await apiRequest(`/api/devices/${deviceId}/snmp/walk`, {
+      method: "POST",
+      body: {
+        baseOid,
+        community: data.get("community"),
+        port: Number(data.get("port") || 161),
+        limit: 128,
+      },
+    });
+    state.snmpDiscovery = {
+      deviceId,
+      baseOid: payload.baseOid,
+      items: payload.items || [],
+    };
+    if (results) {
+      results.innerHTML = renderSnmpDiscoveryResults(state.snmpDiscovery.items);
+      results.querySelector("[data-action='create-discovered-sensors']")?.addEventListener("click", async () => {
+        await createDiscoveredSnmpSensors(form);
+      });
+    }
+    if (message) message.textContent = `SNMP walk completed. Found ${payload.count || 0} row(s).`;
+  } catch (error) {
+    if (results) results.innerHTML = `<p>${escapeHtml(error.message)}</p>`;
+    if (message) message.textContent = error.message;
+  }
+}
+
+async function scanInterfaceTraffic(form) {
+  if (!form) return;
+  const message = form.querySelector("[data-form-message='sensor']");
+  const results = form.querySelector("[data-traffic-discovery-results]");
+  const data = new FormData(form);
+  const deviceId = state.selectedDeviceId;
+  try {
+    if (!deviceId) throw new Error("Select a device from the monitoring tree first.");
+    state.interfaceDiscovery = null;
+    if (message) message.textContent = "Discovering interface traffic counters...";
+    if (results) results.innerHTML = `<p>Scanning interface table. This may take a few seconds.</p>`;
+    const payload = await apiRequest(`/api/devices/${deviceId}/interfaces/discover`, {
+      method: "POST",
+      body: {
+        community: data.get("community"),
+        port: Number(data.get("port") || 161),
+        limit: 128,
+      },
+    });
+    state.interfaceDiscovery = {
+      deviceId,
+      interfaces: payload.interfaces || [],
+    };
+    if (results) {
+      results.innerHTML = renderTrafficDiscoveryResults(state.interfaceDiscovery.interfaces);
+      results.querySelector("[data-action='create-traffic-sensors']")?.addEventListener("click", async () => {
+        await createTrafficSensors(form);
+      });
+    }
+    if (message) message.textContent = `Interface discovery completed. Found ${payload.count || 0} interface(s).`;
+  } catch (error) {
+    if (results) results.innerHTML = `<p>${escapeHtml(error.message)}</p>`;
+    if (message) message.textContent = error.message;
+  }
+}
+
+async function createDiscoveredSnmpSensors(form) {
+  if (!form) return;
+  const message = form.querySelector("[data-form-message='sensor']");
+  const data = new FormData(form);
+  const deviceId = state.selectedDeviceId;
+  const discovery = state.snmpDiscovery;
+  try {
+    if (!deviceId) throw new Error("Select a device from the monitoring tree first.");
+    if (!discovery || String(discovery.deviceId) !== String(deviceId) || !discovery.items?.length) {
+      throw new Error("Run SNMP walk discovery first.");
+    }
+    const baseName = String(data.get("name") || "").trim() || "SNMP";
+    const sensors = discovery.items.map((item) => {
+      const label = item.value || `index ${item.index}`;
+      return {
+        name: `${baseName} ${label}`,
+        interval: Number(data.get("interval") || 30),
+        oid: item.oid,
+        unit: data.get("unit"),
+        community: data.get("community"),
+        port: Number(data.get("port") || 161),
+      };
+    });
+    if (message) message.textContent = `Creating ${sensors.length} SNMP sensor(s)...`;
+    await apiRequest(`/api/devices/${deviceId}/sensors/bulk`, {
+      method: "POST",
+      body: { sensors },
+    });
+    state.snmpDiscovery = null;
+    form.closest("dialog")?.close();
+    form.reset();
+    await loadData();
+  } catch (error) {
+    if (message) message.textContent = error.message;
+  }
+}
+
+async function createTrafficSensors(form) {
+  if (!form) return;
+  const message = form.querySelector("[data-form-message='sensor']");
+  const data = new FormData(form);
+  const deviceId = state.selectedDeviceId;
+  const discovery = state.interfaceDiscovery;
+  try {
+    if (!deviceId) throw new Error("Select a device from the monitoring tree first.");
+    if (!discovery || String(discovery.deviceId) !== String(deviceId) || !discovery.interfaces?.length) {
+      throw new Error("Run interface traffic discovery first.");
+    }
+    const baseName = String(data.get("name") || "").trim() || "Traffic";
+    const interfaces = discovery.interfaces.map((item) => ({
+      ...item,
+      sensorName: `${baseName} ${item.name || `ifIndex ${item.index}`}`,
+    }));
+    if (message) message.textContent = `Creating ${interfaces.length} traffic sensor(s)...`;
+    await apiRequest(`/api/devices/${deviceId}/interfaces/traffic-sensors`, {
+      method: "POST",
+      body: {
+        interfaces,
+        interval: Number(data.get("interval") || 30),
+        community: data.get("community"),
+        port: Number(data.get("port") || 161),
+      },
+    });
+    state.interfaceDiscovery = null;
+    form.closest("dialog")?.close();
+    form.reset();
+    await loadData();
+  } catch (error) {
+    if (message) message.textContent = error.message;
+  }
+}
+
 async function saveDevice(event) {
   event.preventDefault();
   const form = event.currentTarget;
@@ -1115,6 +1700,26 @@ async function saveDevice(event) {
         snmpCommunity: data.get("snmpCommunity"),
         snmpPort: Number(data.get("snmpPort") || 161),
       },
+    });
+    form.closest("dialog")?.close();
+    form.reset();
+    state.pendingDeviceGroup = "";
+    await loadData();
+  } catch (error) {
+    message.textContent = error.message;
+  }
+}
+
+async function saveGroup(event) {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const message = form.querySelector("[data-form-message='group']");
+  const data = new FormData(form);
+  try {
+    message.textContent = "Saving group...";
+    await apiRequest("/api/groups", {
+      method: "POST",
+      body: { name: data.get("name") },
     });
     form.closest("dialog")?.close();
     form.reset();
@@ -1145,6 +1750,9 @@ async function saveSensor(event) {
   const deviceId = state.selectedDeviceId;
   try {
     if (!deviceId) throw new Error("Select a device from the monitoring tree first.");
+    if (data.get("type") === "snmp_traffic") {
+      throw new Error("Use Scan Ports, then Create Traffic Sensors.");
+    }
     message.textContent = "Saving sensor and running first check...";
     await apiRequest(`/api/devices/${deviceId}/sensors`, {
       method: "POST",
@@ -1169,7 +1777,25 @@ async function saveSensor(event) {
 async function checkSensor(sensorId) {
   if (!sensorId) return;
   await apiRequest(`/api/sensors/${sensorId}/check-now`, { method: "POST" });
+  delete state.sensorSamples[String(sensorId)];
   await loadData();
+}
+
+async function loadSensorSamples(sensorId) {
+  const key = String(sensorId);
+  if (state.sensorSamples[key] || state.sensorSamplesLoading[key]) return;
+  state.sensorSamplesLoading[key] = true;
+  try {
+    const samples = await fetchJson(`/api/sensors/${sensorId}/samples`);
+    state.sensorSamples[key] = normalizeList(samples);
+  } catch {
+    state.sensorSamples[key] = [];
+  } finally {
+    state.sensorSamplesLoading[key] = false;
+    if (state.activeView === "sensor-detail" && String(state.selectedSensorId) === key) {
+      render();
+    }
+  }
 }
 
 async function deleteSensor(sensorId) {
