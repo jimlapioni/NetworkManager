@@ -12,7 +12,7 @@ import time
 from datetime import datetime, timezone
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import unquote, urlparse
+from urllib.parse import parse_qs, unquote, urlparse
 
 
 ROOT = Path(__file__).resolve().parent
@@ -251,6 +251,60 @@ def parse_snmp_int(value) -> int:
     return int(match.group(0))
 
 
+def normalize_oid(value) -> str:
+    return re.sub(r"\s+", "", str(value or "").strip().lstrip("."))
+
+
+def sensor_duplicate_keys(sensor_type: str, config: dict) -> list[tuple[str, str]]:
+    if sensor_type == "snmp":
+        oid = normalize_oid(config.get("oid"))
+        return [("oid", oid)] if oid else []
+    if sensor_type == "snmp_traffic":
+        keys = []
+        index = str(config.get("index") or "").strip()
+        if index:
+            keys.append(("traffic-index", index))
+        for name in ("speedOid", "inOid", "outOid"):
+            oid = normalize_oid(config.get(name))
+            if oid:
+                keys.append(("oid", oid))
+        return keys
+    return []
+
+
+def existing_sensor_keys(connection: sqlite3.Connection, device_id: int) -> dict[tuple[str, str], str]:
+    rows = connection.execute(
+        "SELECT name, type, config_json FROM sensors WHERE device_id = ? AND type IN ('snmp', 'snmp_traffic')",
+        (device_id,),
+    ).fetchall()
+    keys = {}
+    for row in rows:
+        config = json.loads(row["config_json"] or "{}")
+        for key in sensor_duplicate_keys(row["type"], config):
+            keys[key] = row["name"]
+    return keys
+
+
+def duplicate_message(key: tuple[str, str], owner: str | None = None) -> str:
+    if key[0] == "traffic-index":
+        detail = f" already used by {owner}" if owner else ""
+        return f"Duplicate interface index {key[1]} for this device{detail}."
+    detail = f" already used by {owner}" if owner else ""
+    return f"Duplicate OID {key[1]} for this device{detail}."
+
+
+def assert_unique_sensor_configs(connection: sqlite3.Connection, device_id: int, configs: list[tuple[str, dict]]) -> None:
+    existing = existing_sensor_keys(connection, device_id)
+    batch = {}
+    for sensor_type, config in configs:
+        for key in sensor_duplicate_keys(sensor_type, config):
+            if key in existing:
+                raise ValueError(duplicate_message(key, existing[key]))
+            if key in batch:
+                raise ValueError(duplicate_message(key, batch[key]))
+            batch[key] = str(config.get("interfaceName") or config.get("oid") or config.get("index") or "this request").strip()
+
+
 def get_devices() -> list[dict]:
     with DB_LOCK, db() as connection:
         rows = connection.execute("SELECT * FROM devices ORDER BY group_name, name").fetchall()
@@ -285,6 +339,34 @@ def get_sensor_samples(sensor_id: int, limit: int = 80) -> list[dict]:
             (sensor_id, limit),
         ).fetchall()
         return [row_to_sample(row) for row in rows]
+
+
+def get_device_traffic_samples(device_id: int, limit: int = 24) -> dict:
+    limit = min(max(1, int(limit or 24)), 80)
+    with DB_LOCK, db() as connection:
+        device = connection.execute("SELECT id FROM devices WHERE id = ?", (device_id,)).fetchone()
+        if not device:
+            raise ValueError("Device not found.")
+        sensors = connection.execute(
+            "SELECT id FROM sensors WHERE device_id = ? AND type = 'snmp_traffic' ORDER BY id DESC",
+            (device_id,),
+        ).fetchall()
+        grouped = {}
+        for sensor in sensors:
+            rows = connection.execute(
+                """
+                SELECT * FROM (
+                    SELECT * FROM samples
+                    WHERE sensor_id = ?
+                    ORDER BY id DESC
+                    LIMIT ?
+                )
+                ORDER BY id ASC
+                """,
+                (sensor["id"], limit),
+            ).fetchall()
+            grouped[str(sensor["id"])] = [row_to_sample(row) for row in rows]
+    return {"ok": True, "deviceId": device_id, "limit": limit, "samples": grouped}
 
 
 def get_summary() -> dict:
@@ -376,6 +458,7 @@ def create_sensor(device_id: int, payload: dict) -> dict:
 
     created_at = now_iso()
     with DB_LOCK, db() as connection:
+        assert_unique_sensor_configs(connection, device_id, [(sensor_type, config)])
         cursor = connection.execute(
             """
             INSERT INTO sensors
@@ -412,6 +495,7 @@ def create_sensors_bulk(device_id: int, payload: dict) -> dict:
 
         created_at = now_iso()
         created_ids = []
+        configs = []
         for item in sensors:
             if not isinstance(item, dict):
                 raise ValueError("Each sensor must be an object.")
@@ -424,6 +508,9 @@ def create_sensors_bulk(device_id: int, payload: dict) -> dict:
                 "community": str(item.get("community") or device["snmp_community"] or "public").strip(),
                 "port": int(item.get("port") or device["snmp_port"] or 161),
             }
+            configs.append(("snmp", config))
+        assert_unique_sensor_configs(connection, device_id, configs)
+        for item, (_, config) in zip(sensors, configs):
             cursor = connection.execute(
                 """
                 INSERT INTO sensors
@@ -464,6 +551,7 @@ def create_interface_traffic_sensors(device_id: int, payload: dict) -> dict:
 
         created_at = now_iso()
         created_ids = []
+        prepared = []
         for item in interfaces:
             if not isinstance(item, dict):
                 raise ValueError("Each interface must be an object.")
@@ -484,6 +572,9 @@ def create_interface_traffic_sensors(device_id: int, payload: dict) -> dict:
                 "community": str(payload.get("community") or item.get("community") or device["snmp_community"] or "public").strip(),
                 "port": int(payload.get("port") or item.get("port") or device["snmp_port"] or 161),
             }
+            prepared.append((item, interface_name, config))
+        assert_unique_sensor_configs(connection, device_id, [("snmp_traffic", config) for _, _, config in prepared])
+        for item, interface_name, config in prepared:
             cursor = connection.execute(
                 """
                 INSERT INTO sensors
@@ -1139,7 +1230,8 @@ class Handler(SimpleHTTPRequestHandler):
         super().__init__(*args, directory=str(ROOT), **kwargs)
 
     def do_GET(self) -> None:
-        path = urlparse(self.path).path
+        parsed_url = urlparse(self.path)
+        path = parsed_url.path
         try:
             if path == "/api/summary":
                 return self.send_json(get_summary())
@@ -1154,6 +1246,11 @@ class Handler(SimpleHTTPRequestHandler):
             match = re.fullmatch(r"/api/sensors/(\d+)/samples", path)
             if match:
                 return self.send_json(get_sensor_samples(int(match.group(1))))
+            match = re.fullmatch(r"/api/devices/(\d+)/traffic-samples", path)
+            if match:
+                query = parse_qs(parsed_url.query)
+                limit = int(query.get("limit", [24])[0] or 24)
+                return self.send_json(get_device_traffic_samples(int(match.group(1)), limit))
             if path == "/api/snmp/templates":
                 return self.send_json(
                     [

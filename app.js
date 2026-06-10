@@ -4,6 +4,7 @@ const state = {
   activeView: "dashboard",
   selectedDeviceId: null,
   selectedSensorId: null,
+  deviceDetailTab: null,
   pendingDeviceGroup: "",
   devices: [],
   groups: [],
@@ -15,6 +16,9 @@ const state = {
   interfaceDiscovery: null,
   sensorSamples: {},
   sensorSamplesLoading: {},
+  portSamples: {},
+  portSamplesLoading: {},
+  portSamplesRefreshTimer: null,
 };
 
 const emptySummary = {
@@ -45,6 +49,7 @@ chartPlot.width = chartPlot.right - chartPlot.left;
 chartPlot.height = chartPlot.bottom - chartPlot.top;
 const chartTimeStepMs = 30 * 1000;
 const chartVisibleWindowMs = 10 * 60 * 1000;
+const deviceSerialNumberOid = "1.3.6.1.2.1.47.1.1.1.1.11";
 
 const snmpOidGuide = [
   {
@@ -66,34 +71,17 @@ const snmpOidGuide = [
     description: "Device system name.",
   },
   {
+    name: "Device Serial Number",
+    oid: deviceSerialNumberOid,
+    unit: "",
+    action: "serial-number",
+    description: "Walks the serial-number table and creates a sensor from the first non-empty value.",
+  },
+  {
     name: "Interface Description",
     oid: "1.3.6.1.2.1.2.2.1.2.{ifIndex}",
     unit: "",
     description: "Port/interface label. Replace {ifIndex}, for example .2.1.2.1.",
-  },
-  {
-    name: "Interface Status",
-    oid: "1.3.6.1.2.1.2.2.1.8.{ifIndex}",
-    unit: "state",
-    description: "Operational status: 1 up, 2 down, 3 testing.",
-  },
-  {
-    name: "Interface Speed",
-    oid: "1.3.6.1.2.1.2.2.1.5.{ifIndex}",
-    unit: "bps",
-    description: "Configured interface speed in bits per second.",
-  },
-  {
-    name: "Inbound Traffic Counter",
-    oid: "1.3.6.1.2.1.2.2.1.10.{ifIndex}",
-    unit: "octets",
-    description: "Inbound byte counter. Use deltas over time to calculate traffic rate.",
-  },
-  {
-    name: "Outbound Traffic Counter",
-    oid: "1.3.6.1.2.1.2.2.1.16.{ifIndex}",
-    unit: "octets",
-    description: "Outbound byte counter. Use deltas over time to calculate traffic rate.",
   },
 ];
 
@@ -164,9 +152,13 @@ function normalizeSummary(value) {
 }
 
 function setView(activeView, payload = {}, options = {}) {
+  const previousDeviceId = state.selectedDeviceId;
   state.activeView = activeView;
   state.selectedDeviceId = payload.deviceId || null;
   state.selectedSensorId = payload.sensorId || null;
+  if (activeView !== "device-detail" || String(previousDeviceId || "") !== String(state.selectedDeviceId || "")) {
+    state.deviceDetailTab = null;
+  }
   render();
   if (options.push !== false) {
     pushRoute();
@@ -197,9 +189,13 @@ function parseRouteHash(hash = window.location.hash) {
 }
 
 function applyRoute(route) {
+  const previousDeviceId = state.selectedDeviceId;
   state.activeView = route.activeView;
   state.selectedDeviceId = route.selectedDeviceId;
   state.selectedSensorId = route.selectedSensorId;
+  if (route.activeView !== "device-detail" || String(previousDeviceId || "") !== String(route.selectedDeviceId || "")) {
+    state.deviceDetailTab = null;
+  }
   render();
 }
 
@@ -218,6 +214,7 @@ function initRouting() {
   state.activeView = route.activeView;
   state.selectedDeviceId = route.selectedDeviceId;
   state.selectedSensorId = route.selectedSensorId;
+  state.deviceDetailTab = null;
   history.replaceState(routeState(), "", routeHash());
   window.addEventListener("popstate", (event) => {
     applyRoute(event.state || parseRouteHash());
@@ -237,6 +234,7 @@ function render() {
     ${renderDeviceModal()}
     ${renderGroupModal()}
     ${renderSensorModal()}
+    ${renderTrafficSensorModal()}
   `;
   bindEvents();
 }
@@ -446,6 +444,10 @@ function renderDeviceDetail() {
     return `<main class="single-view">${emptyState("Device not found", "The selected device is not available from the API.")}</main>`;
   }
   const sensors = state.sensors.filter((sensor) => String(sensor.deviceId) === String(device.id));
+  const portSensors = sensors.filter((sensor) => sensor.type === "snmp_traffic");
+  const assignedSensors = sensors.filter((sensor) => sensor.type !== "snmp_traffic");
+  const activeTab = resolveDeviceDetailTab(portSensors);
+  const portSampleMap = state.portSamples[String(device.id)] || {};
 
   return `
     <main class="single-view device-detail-view">
@@ -472,18 +474,107 @@ function renderDeviceDetail() {
           </div>
         </div>
       </section>
-      <section class="panel">
+      <section class="panel device-monitor-panel">
         <div class="panel-head">
           <div>
-            <h2>Assigned Sensors</h2>
-            <p>Checks attached to this device</p>
+            <h2>${activeTab === "ports" ? "Ports" : "Assigned Sensors"}</h2>
+            <p>${activeTab === "ports" ? "Interface traffic sensors attached to this device" : "Non-port checks attached to this device"}</p>
           </div>
-          <button class="primary-button" data-action="open-sensor-modal" data-device-id="${device.id}">${icon("plus")} Sensor</button>
+          <div class="panel-head-actions">
+            ${activeTab === "ports" ? renderPortChartLegend() : ""}
+            ${
+              activeTab === "ports"
+                ? `<button class="primary-button" data-action="open-traffic-modal" data-device-id="${device.id}">${icon("plus")} Traffic Sensor</button>`
+                : `<button class="primary-button" data-action="open-sensor-modal" data-device-id="${device.id}">${icon("plus")} Sensor</button>`
+            }
+          </div>
         </div>
-        ${renderSensorTable(sensors, { showDevice: false })}
+        <div class="device-detail-tabs" role="tablist" aria-label="Device detail sections">
+          <button class="${activeTab === "ports" ? "active" : ""}" type="button" data-action="set-device-detail-tab" data-device-tab="ports" role="tab" aria-selected="${activeTab === "ports"}">
+            <span>Ports</span><strong>${portSensors.length}</strong>
+          </button>
+          <button class="${activeTab === "sensors" ? "active" : ""}" type="button" data-action="set-device-detail-tab" data-device-tab="sensors" role="tab" aria-selected="${activeTab === "sensors"}">
+            <span>Sensors</span><strong>${assignedSensors.length}</strong>
+          </button>
+        </div>
+        ${activeTab === "ports" ? renderPortGrid(portSensors, portSampleMap) : renderSensorTable(assignedSensors, { showDevice: false })}
       </section>
     </main>
   `;
+}
+
+function renderPortChartLegend() {
+  return `
+    <div class="port-chart-legend" aria-label="Port mini chart legend">
+      <span><i class="legend-in"></i>Inbound</span>
+      <span><i class="legend-out"></i>Outbound</span>
+    </div>
+  `;
+}
+
+function resolveDeviceDetailTab(portSensors) {
+  if (state.deviceDetailTab === "sensors" || state.deviceDetailTab === "ports") return state.deviceDetailTab;
+  if (!portSensors.length) return "sensors";
+  return "ports";
+}
+
+function renderPortGrid(portSensors, portSampleMap = {}) {
+  if (!portSensors.length) {
+    return emptyState("No ports", "Interface traffic sensors will appear here after SNMP traffic discovery.");
+  }
+
+  return `
+    <div class="port-grid">
+      ${portSensors
+        .map(
+          (sensor) => `
+            <button class="port-tile ${sensor.status || "unknown"}" type="button" data-sensor-id="${sensor.id}" title="${escapeAttribute(sensor.config?.interfaceName || sensor.name || "")}">
+              <span class="port-light ${sensor.status || "unknown"}"></span>
+              <span class="port-name">${escapeHtml(shortInterfaceName(sensor.config?.interfaceName || sensor.name || `ifIndex ${sensor.config?.index || ""}`))}</span>
+              <span class="port-desc">${escapeHtml(sensor.config?.interfaceDescription || "No description")}</span>
+              ${renderPortMiniChart(sensor, portSampleMap[String(sensor.id)] || [])}
+              <span class="port-speed">${escapeHtml(formatRate(sensor.config?.interfaceSpeed || 0))}</span>
+            </button>
+          `
+        )
+        .join("")}
+    </div>
+  `;
+}
+
+function renderPortMiniChart(sensor, samples) {
+  const width = 120;
+  const height = 36;
+  const values = samples.map((sample) => ({
+    inBps: Number(sample.meta?.inBps || 0),
+    outBps: Number(sample.meta?.outBps || 0),
+  }));
+  const max = Math.max(0, ...values.flatMap((item) => [item.inBps, item.outBps]));
+  const inbound = miniChartPoints(values.map((item) => item.inBps), max, width, height);
+  const outbound = miniChartPoints(values.map((item) => item.outBps), max, width, height);
+  const empty = values.length < 2;
+  return `
+    <span class="port-mini-chart ${empty ? "empty" : ""}" aria-label="Mini traffic chart">
+      <svg viewBox="0 0 ${width} ${height}" focusable="false" aria-hidden="true">
+        <line class="port-chart-baseline" x1="0" y1="${height - 4}" x2="${width}" y2="${height - 4}"></line>
+        <polyline class="port-chart-in" points="${inbound}"></polyline>
+        <polyline class="port-chart-out" points="${outbound}"></polyline>
+      </svg>
+    </span>
+  `;
+}
+
+function miniChartPoints(values, max, width, height) {
+  if (values.length < 2 || max <= 0) {
+    return `0,${height - 4} ${width},${height - 4}`;
+  }
+  return values
+    .map((value, index) => {
+      const x = (index / Math.max(1, values.length - 1)) * width;
+      const y = height - 4 - (Number(value || 0) / max) * (height - 8);
+      return `${x.toFixed(1)},${y.toFixed(1)}`;
+    })
+    .join(" ");
 }
 
 function renderSensorDetail() {
@@ -730,6 +821,23 @@ function formatRate(value) {
     current /= 1000;
   }
   return `${current.toFixed(2)} ${unit}`;
+}
+
+function formatPortRate(value) {
+  const text = String(value || "").trim();
+  if (!text) return "In - / Out -";
+  return text.replace(/\s+\/\s+/g, " / ");
+}
+
+function shortInterfaceName(value) {
+  return String(value || "")
+    .trim()
+    .replace(/^Ten-GigabitEthernet/i, "Te")
+    .replace(/^M-GigabitEthernet/i, "M-Gi")
+    .replace(/^GigabitEthernet/i, "Gi")
+    .replace(/^Bridge-Aggregation/i, "BAGG")
+    .replace(/^Vlan-interface/i, "Vlan")
+    .replace(/\s+/g, " ");
 }
 
 function metricCard(label, value, caption, tone) {
@@ -1064,7 +1172,6 @@ function renderSensorModal() {
             <div class="segmented-control">
               <label><input type="radio" name="type" value="icmp" checked /> <span>ICMP Ping</span></label>
               <label><input type="radio" name="type" value="snmp" /> <span>SNMP v2c GET</span></label>
-              <label><input type="radio" name="type" value="snmp_traffic" /> <span>Interface Traffic</span></label>
             </div>
           </div>
           <label>Name<input name="name" type="text" placeholder="ICMP Ping" /></label>
@@ -1095,18 +1202,6 @@ function renderSensorModal() {
                 <p>Example: walk <code>1.3.6.1.2.1.2.2.1.2</code> to discover interface names and indexes.</p>
               </div>
             </section>
-            <section class="snmp-discovery traffic-discovery" data-traffic-discovery hidden>
-              <div class="snmp-discovery-head">
-                <div>
-                  <strong>Interface Traffic Discovery</strong>
-                  <span>Discover ports, pair each index with inbound/outbound HC octet counters, and create traffic sensors.</span>
-                </div>
-                <button class="mini-action" type="button" data-action="scan-interface-traffic">${icon("radar")} Scan Ports</button>
-              </div>
-              <div class="snmp-discovery-results" data-traffic-discovery-results>
-                <p>Uses <code>1.3.6.1.2.1.2.2.1.2</code> for port names, then maps inbound <code>1.3.6.1.2.1.31.1.1.1.6.X</code> and outbound <code>1.3.6.1.2.1.31.1.1.1.10.X</code>.</p>
-              </div>
-            </section>
           </div>
         </div>
         <div class="modal-note" data-form-message="sensor">ICMP uses the selected device host. Choose SNMP to enter OID, community, and port.</div>
@@ -1119,7 +1214,47 @@ function renderSensorModal() {
   `;
 }
 
+function renderTrafficSensorModal() {
+  const device = state.devices.find((item) => String(item.id) === String(state.selectedDeviceId));
+  return `
+    <dialog id="traffic-modal">
+      <form class="modal-card" data-form="traffic-sensor">
+        <div class="modal-head">
+          <div>
+            <h2>Add Traffic Sensors</h2>
+            <p>${device ? `Discover interface traffic on ${escapeHtml(device.name || device.host)}` : "Select a device first."}</p>
+          </div>
+          <button class="icon-button" type="button" data-action="close-dialog" aria-label="Close">${icon("close")}</button>
+        </div>
+        <div class="form-grid">
+          <label>Interval Seconds<input name="interval" type="number" value="30" min="10" /></label>
+          <label>Community<input name="community" type="password" placeholder="Use device community" /></label>
+          <label>Port<input name="port" type="number" value="${device?.snmpPort || 161}" /></label>
+          <section class="snmp-discovery traffic-discovery">
+            <div class="snmp-discovery-head">
+              <div>
+                <strong>Interface Traffic Discovery</strong>
+                <span>Discover ports, pair each index with inbound/outbound HC octet counters, and create only missing traffic sensors.</span>
+              </div>
+              <button class="mini-action" type="button" data-action="scan-interface-traffic">${icon("radar")} Scan Ports</button>
+            </div>
+            <div class="snmp-discovery-results" data-traffic-discovery-results>
+              <p>Uses <code>1.3.6.1.2.1.2.2.1.2</code> for port names, <code>1.3.6.1.2.1.2.2.1.5.X</code> for speed, then maps inbound <code>1.3.6.1.2.1.31.1.1.1.6.X</code> and outbound <code>1.3.6.1.2.1.31.1.1.1.10.X</code>.</p>
+            </div>
+          </section>
+        </div>
+        <div class="modal-note" data-form-message="traffic">Scan ports first, then create missing traffic sensors.</div>
+        <div class="modal-actions">
+          <button class="ghost-button" type="button" data-action="close-dialog">Cancel</button>
+        </div>
+      </form>
+    </dialog>
+  `;
+}
+
 function renderOidGuideItem(item) {
+  const action = item.action === "serial-number" ? "read-serial-number" : "use-oid";
+  const label = item.action === "serial-number" ? "Read" : "Use";
   return `
     <article class="oid-guide-item">
       <div>
@@ -1130,11 +1265,11 @@ function renderOidGuideItem(item) {
       <button
         class="mini-action"
         type="button"
-        data-action="use-oid"
+        data-action="${action}"
         data-oid="${escapeAttribute(item.oid)}"
         data-name="${escapeAttribute(item.name)}"
         data-unit="${escapeAttribute(item.unit)}"
-      >Use</button>
+      >${label}</button>
     </article>
   `;
 }
@@ -1253,8 +1388,30 @@ function bindEvents() {
     });
   });
 
+  document.querySelectorAll("[data-action='open-traffic-modal']").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      const deviceId = button.dataset.deviceId || state.selectedDeviceId;
+      if (!deviceId) return;
+      state.selectedDeviceId = deviceId;
+      state.activeView = "device-detail";
+      state.deviceDetailTab = "ports";
+      state.interfaceDiscovery = null;
+      render();
+      document.querySelector("#traffic-modal")?.showModal();
+    });
+  });
+
   document.querySelectorAll("[data-action='open-group-modal']").forEach((button) => {
     button.addEventListener("click", () => document.querySelector("#group-modal")?.showModal());
+  });
+
+  document.querySelectorAll("[data-action='set-device-detail-tab']").forEach((button) => {
+    button.addEventListener("click", (event) => {
+      event.stopPropagation();
+      state.deviceDetailTab = button.dataset.deviceTab || "ports";
+      render();
+    });
   });
 
   document.querySelectorAll("[data-action='close-dialog']").forEach((button) => {
@@ -1293,6 +1450,10 @@ function bindEvents() {
     button.addEventListener("click", () => applyOidGuide(button));
   });
 
+  document.querySelectorAll("[data-action='read-serial-number']").forEach((button) => {
+    button.addEventListener("click", async () => readSerialNumberSensor(button));
+  });
+
   document.querySelectorAll("[data-action='scan-snmp-walk']").forEach((button) => {
     button.addEventListener("click", async () => scanSnmpWalk(button.closest("form")));
   });
@@ -1316,6 +1477,7 @@ function bindEvents() {
   document.querySelector("[data-form='device']")?.addEventListener("submit", saveDevice);
   document.querySelector("[data-form='group']")?.addEventListener("submit", saveGroup);
   document.querySelector("[data-form='device-group']")?.addEventListener("submit", saveDeviceGroup);
+  document.querySelector("[data-form='traffic-sensor']")?.addEventListener("submit", (event) => event.preventDefault());
   const sensorForm = document.querySelector("[data-form='sensor']");
   sensorForm?.addEventListener("submit", saveSensor);
   sensorForm?.querySelectorAll("input[name='type']").forEach((input) => {
@@ -1323,9 +1485,77 @@ function bindEvents() {
   });
   if (sensorForm) updateSensorTypeFields(sensorForm);
   syncTableScrollbars();
+  managePortSamplesPolling();
   if (state.activeView === "sensor-detail" && state.selectedSensorId) {
     loadSensorSamples(state.selectedSensorId);
   }
+}
+
+function currentVisiblePortDeviceId() {
+  if (state.activeView !== "device-detail" || !state.selectedDeviceId) return null;
+  const portSensors = state.sensors.filter(
+    (sensor) => String(sensor.deviceId) === String(state.selectedDeviceId) && sensor.type === "snmp_traffic"
+  );
+  if (!portSensors.length || resolveDeviceDetailTab(portSensors) !== "ports") return null;
+  return String(state.selectedDeviceId);
+}
+
+function managePortSamplesPolling() {
+  const deviceId = currentVisiblePortDeviceId();
+  if (!deviceId) {
+    clearPortSamplesRefreshTimer();
+    return;
+  }
+  if (!state.portSamples[deviceId] && !state.portSamplesLoading[deviceId]) {
+    loadPortSamples(deviceId);
+  }
+  if (!state.portSamplesRefreshTimer) {
+    state.portSamplesRefreshTimer = window.setTimeout(refreshVisiblePortData, 30 * 1000);
+  }
+}
+
+function clearPortSamplesRefreshTimer() {
+  if (!state.portSamplesRefreshTimer) return;
+  window.clearTimeout(state.portSamplesRefreshTimer);
+  state.portSamplesRefreshTimer = null;
+}
+
+async function refreshVisiblePortData() {
+  state.portSamplesRefreshTimer = null;
+  const deviceId = currentVisiblePortDeviceId();
+  if (!deviceId) return;
+  try {
+    const [sensors, trafficSamples] = await Promise.all([
+      fetchJson("/api/sensors"),
+      fetchJson(`/api/devices/${deviceId}/traffic-samples?limit=24`),
+    ]);
+    state.sensors = normalizeList(sensors);
+    state.portSamples[deviceId] = normalizeTrafficSamples(trafficSamples);
+  } catch {
+    state.portSamples[deviceId] = state.portSamples[deviceId] || {};
+  } finally {
+    if (currentVisiblePortDeviceId() === deviceId) render();
+  }
+}
+
+async function loadPortSamples(deviceId, options = {}) {
+  const key = String(deviceId);
+  if (!options.force && (state.portSamples[key] || state.portSamplesLoading[key])) return;
+  state.portSamplesLoading[key] = true;
+  try {
+    const trafficSamples = await fetchJson(`/api/devices/${key}/traffic-samples?limit=24`);
+    state.portSamples[key] = normalizeTrafficSamples(trafficSamples);
+  } catch {
+    state.portSamples[key] = {};
+  } finally {
+    state.portSamplesLoading[key] = false;
+    if (currentVisiblePortDeviceId() === key) render();
+  }
+}
+
+function normalizeTrafficSamples(payload) {
+  if (payload?.samples && typeof payload.samples === "object" && !Array.isArray(payload.samples)) return payload.samples;
+  return {};
 }
 
 function syncTableScrollbars() {
@@ -1430,26 +1660,18 @@ function updateSensorTypeFields(form) {
   const nameInput = form.querySelector("input[name='name']");
   const message = form.querySelector("[data-form-message='sensor']");
   const isSnmp = type === "snmp";
-  const isTraffic = type === "snmp_traffic";
 
-  if (snmpFields) snmpFields.hidden = !(isSnmp || isTraffic);
+  if (snmpFields) snmpFields.hidden = !isSnmp;
   form.querySelectorAll("[data-snmp-get-only]").forEach((element) => {
     element.hidden = !isSnmp;
   });
-  form.querySelectorAll("[data-traffic-discovery]").forEach((element) => {
-    element.hidden = !isTraffic;
-  });
   if (nameInput) {
-    nameInput.placeholder = isTraffic ? "Traffic" : isSnmp ? "SNMP Uptime" : "ICMP Ping";
+    nameInput.placeholder = isSnmp ? "SNMP Uptime" : "ICMP Ping";
   }
   if (message) {
-    if (isTraffic) {
-      message.textContent = "Scan interfaces and create one inbound/outbound traffic sensor per port.";
-    } else {
-      message.textContent = isSnmp
-        ? "Enter the SNMP v2c OID, community, and UDP port for this device."
-        : "ICMP uses the selected device host. No SNMP parameters are required.";
-    }
+    message.textContent = isSnmp
+      ? "Enter the SNMP v2c OID, community, and UDP port for this device."
+      : "ICMP uses the selected device host. No SNMP parameters are required.";
   }
 }
 
@@ -1468,6 +1690,48 @@ function applyOidGuide(button) {
     message.textContent = (button.dataset.oid || "").includes("{ifIndex}")
       ? "This OID needs an interface index. Replace {ifIndex} with the target port index before saving."
       : "OID guide value applied. You can save or adjust the fields.";
+  }
+}
+
+async function readSerialNumberSensor(button) {
+  const form = button.closest("form");
+  if (!form) return;
+  const message = form.querySelector("[data-form-message='sensor']");
+  const data = new FormData(form);
+  const deviceId = state.selectedDeviceId;
+  const baseOid = button.dataset.oid || deviceSerialNumberOid;
+  try {
+    if (!deviceId) throw new Error("Select a device from the monitoring tree first.");
+    if (message) message.textContent = "Reading device serial number table...";
+    const payload = await apiRequest(`/api/devices/${deviceId}/snmp/walk`, {
+      method: "POST",
+      body: {
+        baseOid,
+        community: data.get("community"),
+        port: Number(data.get("port") || 161),
+        limit: 128,
+      },
+    });
+    const item = (payload.items || []).find((row) => String(row.value || "").trim());
+    if (!item) throw new Error("No serial number value found.");
+    if (message) message.textContent = `Creating serial number sensor from ${item.oid}...`;
+    await apiRequest(`/api/devices/${deviceId}/sensors`, {
+      method: "POST",
+      body: {
+        type: "snmp",
+        name: "Device Serial Number",
+        interval: Number(data.get("interval") || 30),
+        oid: item.oid,
+        unit: "",
+        community: data.get("community"),
+        port: Number(data.get("port") || 161),
+      },
+    });
+    form.closest("dialog")?.close();
+    form.reset();
+    await loadData();
+  } catch (error) {
+    if (message) message.textContent = error.message;
   }
 }
 
@@ -1505,33 +1769,82 @@ function renderTrafficDiscoveryResults(items) {
     return `<p>No interfaces found. Check SNMP access or try a device that exposes IF-MIB.</p>`;
   }
 
+  const missingItems = newDiscoveredTrafficInterfaces(items);
   const visibleItems = items.slice(0, 40);
   const hiddenCount = Math.max(0, items.length - visibleItems.length);
   return `
-    <p>Found ${items.length} interface(s). Each one will become a traffic sensor with inbound and outbound counters.</p>
+    <p>Found ${items.length} interface(s). ${missingItems.length} missing traffic sensor(s) can be created.</p>
     <div class="traffic-discovery-list">
       ${visibleItems
-        .map(
-          (item) => `
-            <div class="traffic-discovery-row">
+        .map((item) => {
+          const reasons = trafficDuplicateReasons(item);
+          return `
+            <div class="traffic-discovery-row ${reasons.length ? "existing" : ""}">
               <strong>#${escapeHtml(item.index || "-")}</strong>
               <span>
                 <b>${escapeHtml(item.name || "-")}</b>
-                <small>${escapeHtml([item.description, item.speedBps ? `Speed ${formatRate(item.speedBps)}` : ""].filter(Boolean).join(" · ") || "No description")}</small>
+                <small>${escapeHtml([item.description, item.speedBps ? `Speed ${formatRate(item.speedBps)}` : ""].filter(Boolean).join(" / ") || "No description")}</small>
               </span>
               <code>SPEED ${escapeHtml(item.speedOid || "")}</code>
               <code>IN ${escapeHtml(item.inOid || "")}</code>
               <code>OUT ${escapeHtml(item.outOid || "")}</code>
+              <em>${reasons.length ? "Exists" : "New"}</em>
             </div>
-          `
-        )
+          `;
+        })
         .join("")}
     </div>
     ${hiddenCount ? `<p>${hiddenCount} more interface(s) are hidden from preview but will still be created.</p>` : ""}
     <div class="snmp-discovery-actions">
-      <button class="primary-button" type="button" data-action="create-traffic-sensors">${icon("plus")} Create ${items.length} Traffic Sensors</button>
+      <button class="primary-button" type="button" data-action="create-traffic-sensors" ${missingItems.length ? "" : "disabled"}>${icon("plus")} Create ${missingItems.length} Traffic Sensors</button>
     </div>
   `;
+}
+
+function normalizeClientOid(value) {
+  return String(value || "").trim().replace(/^\.+/, "").replace(/\s+/g, "");
+}
+
+function existingTrafficKeys(deviceId = state.selectedDeviceId) {
+  const keys = { indexes: new Set(), oids: new Set() };
+  state.sensors
+    .filter((sensor) => String(sensor.deviceId) === String(deviceId) && sensor.type === "snmp_traffic")
+    .forEach((sensor) => {
+      const index = String(sensor.config?.index || "").trim();
+      if (index) keys.indexes.add(index);
+      ["speedOid", "inOid", "outOid"].forEach((name) => {
+        const oid = normalizeClientOid(sensor.config?.[name]);
+        if (oid) keys.oids.add(oid);
+      });
+    });
+  return keys;
+}
+
+function trafficDuplicateReasons(item) {
+  const keys = existingTrafficKeys();
+  const reasons = [];
+  const index = String(item.index || "").trim();
+  if (index && keys.indexes.has(index)) reasons.push("index");
+  ["speedOid", "inOid", "outOid"].forEach((name) => {
+    const oid = normalizeClientOid(item[name]);
+    if (oid && keys.oids.has(oid)) reasons.push(name);
+  });
+  return reasons;
+}
+
+function newDiscoveredTrafficInterfaces(items) {
+  const requestIndexes = new Set();
+  const requestOids = new Set();
+  return items.filter((item) => {
+    if (trafficDuplicateReasons(item).length) return false;
+    const index = String(item.index || "").trim();
+    if (!index || requestIndexes.has(index)) return false;
+    const oids = ["speedOid", "inOid", "outOid"].map((name) => normalizeClientOid(item[name])).filter(Boolean);
+    if (oids.some((oid) => requestOids.has(oid))) return false;
+    requestIndexes.add(index);
+    oids.forEach((oid) => requestOids.add(oid));
+    return true;
+  });
 }
 
 async function scanSnmpWalk(form) {
@@ -1576,7 +1889,7 @@ async function scanSnmpWalk(form) {
 
 async function scanInterfaceTraffic(form) {
   if (!form) return;
-  const message = form.querySelector("[data-form-message='sensor']");
+  const message = form.querySelector("[data-form-message='traffic'], [data-form-message='sensor']");
   const results = form.querySelector("[data-traffic-discovery-results]");
   const data = new FormData(form);
   const deviceId = state.selectedDeviceId;
@@ -1649,7 +1962,7 @@ async function createDiscoveredSnmpSensors(form) {
 
 async function createTrafficSensors(form) {
   if (!form) return;
-  const message = form.querySelector("[data-form-message='sensor']");
+  const message = form.querySelector("[data-form-message='traffic'], [data-form-message='sensor']");
   const data = new FormData(form);
   const deviceId = state.selectedDeviceId;
   const discovery = state.interfaceDiscovery;
@@ -1659,10 +1972,11 @@ async function createTrafficSensors(form) {
       throw new Error("Run interface traffic discovery first.");
     }
     const baseName = String(data.get("name") || "").trim() || "Traffic";
-    const interfaces = discovery.interfaces.map((item) => ({
+    const interfaces = newDiscoveredTrafficInterfaces(discovery.interfaces).map((item) => ({
       ...item,
       sensorName: `${baseName} ${item.name || `ifIndex ${item.index}`}`,
     }));
+    if (!interfaces.length) throw new Error("All discovered interfaces already have traffic sensors.");
     if (message) message.textContent = `Creating ${interfaces.length} traffic sensor(s)...`;
     await apiRequest(`/api/devices/${deviceId}/interfaces/traffic-sensors`, {
       method: "POST",
@@ -1750,9 +2064,6 @@ async function saveSensor(event) {
   const deviceId = state.selectedDeviceId;
   try {
     if (!deviceId) throw new Error("Select a device from the monitoring tree first.");
-    if (data.get("type") === "snmp_traffic") {
-      throw new Error("Use Scan Ports, then Create Traffic Sensors.");
-    }
     message.textContent = "Saving sensor and running first check...";
     await apiRequest(`/api/devices/${deviceId}/sensors`, {
       method: "POST",
@@ -1776,9 +2087,13 @@ async function saveSensor(event) {
 
 async function checkSensor(sensorId) {
   if (!sensorId) return;
-  await apiRequest(`/api/sensors/${sensorId}/check-now`, { method: "POST" });
+  const updated = await apiRequest(`/api/sensors/${sensorId}/check-now`, { method: "POST" });
   delete state.sensorSamples[String(sensorId)];
   await loadData();
+  const portDeviceId = currentVisiblePortDeviceId();
+  if (portDeviceId && String(updated?.deviceId || "") === portDeviceId) {
+    await loadPortSamples(portDeviceId, { force: true });
+  }
 }
 
 async function loadSensorSamples(sensorId) {
@@ -1841,6 +2156,10 @@ async function checkAllSensors() {
     await apiRequest(`/api/sensors/${sensor.id}/check-now`, { method: "POST" });
   }
   await loadData();
+  const portDeviceId = currentVisiblePortDeviceId();
+  if (portDeviceId) {
+    await loadPortSamples(portDeviceId, { force: true });
+  }
 }
 
 function icon(name) {
