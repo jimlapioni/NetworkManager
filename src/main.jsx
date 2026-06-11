@@ -311,10 +311,15 @@ function Sidebar({ data, route, setRoute }) {
         <div className="tree-scroll">
           {groups.map((group) => (
             <article className="tree-group" key={group.name}>
-              <div className="tree-group-head"><span className={`dot ${group.status}`} /><strong>{group.name}</strong><small>{group.devices.length}</small></div>
+              <button className="tree-group-button" type="button">
+                <span className={`status-dot ${group.status}`} />
+                <strong>{group.name}</strong>
+                <small>{group.devices.length}</small>
+              </button>
               {group.devices.map((device) => (
                 <button className={`tree-device ${String(device.id) === String(route.deviceId) ? "active" : ""}`} key={device.id} onClick={() => setRoute({ view: "device-detail", deviceId: device.id })}>
-                  <span className={`dot ${device.status || "unknown"}`} />{device.name}
+                  <span className={`status-dot ${device.status || "unknown"}`} />
+                  <span className="tree-device-name">{device.name || device.host}</span>
                 </button>
               ))}
             </article>
