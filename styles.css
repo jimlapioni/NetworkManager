@@ -1880,7 +1880,7 @@ dialog::backdrop {
 .segmented-control {
   min-height: 40px;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 6px;
   padding: 4px;
   border: 1px solid var(--line);
@@ -1891,6 +1891,28 @@ dialog::backdrop {
 .segmented-control label {
   min-width: 0;
   display: block;
+}
+
+.segmented-control button {
+  min-width: 0;
+  min-height: 32px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 850;
+  padding: 0 10px;
+}
+
+.segmented-control button:hover,
+.segmented-control button:focus-visible {
+  background: rgba(54, 216, 255, 0.1);
+  color: var(--text);
+}
+
+.segmented-control button.active {
+  background: linear-gradient(135deg, rgba(54, 216, 255, 0.95), rgba(37, 212, 138, 0.88));
+  color: #061016;
 }
 
 .segmented-control input {
@@ -2000,6 +2022,45 @@ textarea:focus {
   border-radius: 8px;
   padding: 10px 12px;
   font-size: 13px;
+}
+
+.modal-note.error {
+  border-color: rgba(242, 95, 92, 0.42);
+  background: rgba(242, 95, 92, 0.1);
+  color: #ffb2b0;
+}
+
+.react-toast {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 30;
+  max-width: 420px;
+  border: 1px solid rgba(242, 95, 92, 0.42);
+  border-radius: 8px;
+  background: rgba(31, 44, 54, 0.96);
+  color: #ffcfcd;
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.34);
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.react-toast button {
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+
+.react-toast svg {
+  width: 14px;
+  height: 14px;
 }
 
 .sensor-type-grid {
