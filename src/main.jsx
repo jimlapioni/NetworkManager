@@ -5,6 +5,16 @@ import "../styles.css";
 const emptySummary = { devices: 0, sensors: 0, up: 0, warning: 0, down: 0, unknown: 0 };
 const statusLabels = { up: "Up", warning: "Warning", down: "Down", unknown: "Unknown", paused: "Paused" };
 const statusRank = ["down", "warning", "unknown", "paused", "up"];
+const chartPlot = {
+  left: 82,
+  right: 744,
+  top: 36,
+  bottom: 268,
+};
+chartPlot.width = chartPlot.right - chartPlot.left;
+chartPlot.height = chartPlot.bottom - chartPlot.top;
+const chartTimeStepMs = 30 * 1000;
+const chartVisibleWindowMs = 10 * 60 * 1000;
 
 async function fetchJson(path) {
   const response = await fetch(path, { headers: { Accept: "application/json" } });
@@ -86,6 +96,8 @@ function App() {
   });
   const [deviceDetailTab, setDeviceDetailTab] = useState(null);
   const [portSamples, setPortSamples] = useState({});
+  const [sensorSamples, setSensorSamples] = useState({});
+  const [sensorSamplesLoading, setSensorSamplesLoading] = useState({});
   const routeRef = useRef(route);
   routeRef.current = route;
 
@@ -177,6 +189,40 @@ function App() {
     };
   }, [route.view, route.deviceId, activeDeviceTab, selectedPortSensors.length]);
 
+  useEffect(() => {
+    if (route.view !== "sensor-detail" || !route.sensorId) return undefined;
+    const sensorId = String(route.sensorId);
+    let cancelled = false;
+
+    async function refreshSensorDetail() {
+      setSensorSamplesLoading((current) => ({ ...current, [sensorId]: true }));
+      try {
+        const [sensors, samples] = await Promise.all([
+          fetchJson("/api/sensors"),
+          fetchJson(`/api/sensors/${sensorId}/samples`),
+        ]);
+        if (cancelled) return;
+        setData((current) => ({ ...current, sensors: normalizeList(sensors) }));
+        setSensorSamples((current) => ({ ...current, [sensorId]: normalizeList(samples) }));
+      } catch {
+        if (!cancelled) {
+          setSensorSamples((current) => ({ ...current, [sensorId]: current[sensorId] || [] }));
+        }
+      } finally {
+        if (!cancelled) {
+          setSensorSamplesLoading((current) => ({ ...current, [sensorId]: false }));
+        }
+      }
+    }
+
+    refreshSensorDetail();
+    const timer = window.setInterval(refreshSensorDetail, 30000);
+    return () => {
+      cancelled = true;
+      window.clearInterval(timer);
+    };
+  }, [route.view, route.sensorId]);
+
   const content = data.loading ? (
     <main className="single-view">{emptyState("Loading", "Fetching live network state...")}</main>
   ) : (
@@ -188,6 +234,8 @@ function App() {
       deviceDetailTab={activeDeviceTab}
       setDeviceDetailTab={setDeviceDetailTab}
       portSamples={portSamples}
+      sensorSamples={sensorSamples}
+      sensorSamplesLoading={sensorSamplesLoading}
       setRoute={setRoute}
     />
   );
@@ -208,7 +256,10 @@ function CurrentView(props) {
   if (props.route.view === "sensors") return <SensorsView data={props.data} setRoute={props.setRoute} />;
   if (props.route.view === "events") return <EventsView events={props.data.events} />;
   if (props.route.view === "device-detail") return <DeviceDetail {...props} />;
-  if (props.route.view === "sensor-detail") return <SensorDetail sensor={props.selectedSensor} />;
+  if (props.route.view === "sensor-detail") {
+    const key = String(props.route.sensorId || "");
+    return <SensorDetail sensor={props.selectedSensor} samples={props.sensorSamples[key] || []} loading={!!props.sensorSamplesLoading[key]} />;
+  }
   return <Dashboard data={props.data} setRoute={props.setRoute} />;
 }
 
@@ -401,6 +452,162 @@ function miniChartPoints(values, max, width, height) {
   }).join(" ");
 }
 
+function SensorChart({ sensor, samples, loading }) {
+  if (loading) return <div className="empty-chart"><span>Loading samples</span></div>;
+  if (!samples.length) return <div className="empty-chart"><span>No samples yet</span></div>;
+
+  const domain = chartDomain(samples);
+  const visibleSamples = chartVisibleSamples(samples, domain);
+
+  if (sensor.type === "snmp_traffic") {
+    const points = visibleSamples.map((sample) => ({
+      inBps: Number(sample.meta?.inBps || 0),
+      outBps: Number(sample.meta?.outBps || 0),
+    }));
+    const measuredMax = Math.max(1, ...points.flatMap((item) => [item.inBps, item.outBps]));
+    const interfaceSpeed = Number(sensor.config?.interfaceSpeed || visibleSamples.at(-1)?.meta?.interfaceSpeed || 0);
+    const axisMax = Math.max(1, interfaceSpeed || measuredMax, measuredMax);
+    const scale = chartScale(axisMax, "rate");
+    return (
+      <div className="traffic-chart">
+        <div className="chart-stats">
+          <div><span>Inbound</span><strong>{formatRate(points.at(-1)?.inBps || 0)}</strong></div>
+          <div><span>Outbound</span><strong>{formatRate(points.at(-1)?.outBps || 0)}</strong></div>
+          <div><span>Peak</span><strong>{formatRate(measuredMax)}</strong></div>
+          <div><span>Axis Max</span><strong>{formatRate(axisMax)}</strong></div>
+        </div>
+        <svg viewBox="0 0 780 330" role="img" aria-label="Interface traffic history">
+          <ChartGrid max={axisMax} scale={scale} domain={domain} />
+          <polyline className="chart-line in" points={chartPoints(points.map((item) => item.inBps), axisMax, visibleSamples, domain)} />
+          <polyline className="chart-line out" points={chartPoints(points.map((item) => item.outBps), axisMax, visibleSamples, domain)} />
+        </svg>
+        <div className="chart-legend">
+          <span><i className="legend-in" />Inbound</span>
+          <span><i className="legend-out" />Outbound</span>
+        </div>
+      </div>
+    );
+  }
+
+  const values = visibleSamples.map((sample) => Number(sample.valueNumber || 0));
+  const max = Math.max(1, ...values);
+  const scale = chartScale(max, "number", sensor.unit || "");
+  return (
+    <div className="traffic-chart">
+      <div className="chart-stats">
+        <div><span>Current</span><strong>{visibleSamples.at(-1)?.valueText || "-"}</strong></div>
+        <div><span>Samples</span><strong>{visibleSamples.length}</strong></div>
+        <div><span>Peak</span><strong>{max.toLocaleString()}</strong></div>
+        <div><span>Axis Max</span><strong>{max.toLocaleString()}</strong></div>
+      </div>
+      <svg viewBox="0 0 780 330" role="img" aria-label="Sensor sample history">
+        <ChartGrid max={max} scale={scale} domain={domain} />
+        <polyline className="chart-line in" points={chartPoints(values, max, visibleSamples, domain)} />
+      </svg>
+    </div>
+  );
+}
+
+function ChartGrid({ max, scale, domain }) {
+  const yTicks = [1, 0.75, 0.5, 0.25, 0];
+  const timeTicks = chartTimeTicks(domain);
+  return (
+    <>
+      <g className="chart-grid">
+        <line x1={chartPlot.left} y1={chartPlot.top} x2={chartPlot.left} y2={chartPlot.bottom} />
+        <line x1={chartPlot.left} y1={chartPlot.bottom} x2={chartPlot.right} y2={chartPlot.bottom} />
+        {timeTicks.map((tick) => <line key={`x-${tick.time}`} x1={tick.x} y1={chartPlot.top} x2={tick.x} y2={chartPlot.bottom} />)}
+        {yTicks.map((ratio) => {
+          const y = chartPlot.bottom - ratio * chartPlot.height;
+          return <line key={`y-${ratio}`} x1={chartPlot.left} y1={y} x2={chartPlot.right} y2={y} />;
+        })}
+      </g>
+      <g className="chart-axis-labels">
+        {yTicks.map((ratio) => {
+          const y = chartPlot.bottom - ratio * chartPlot.height;
+          return <text key={`yl-${ratio}`} x={chartPlot.left - 10} y={y + 4} textAnchor="end">{formatAxisValue(max * ratio, scale)}</text>;
+        })}
+        {timeTicks.map((tick) => <text className="chart-time-label" key={`tl-${tick.time}`} x={tick.x} y="294" textAnchor="middle">{tick.label}</text>)}
+        <text className="chart-axis-title" x={chartPlot.left} y="20" textAnchor="start">{scale.unit}</text>
+        <text className="chart-axis-title" x={(chartPlot.left + chartPlot.right) / 2} y="320" textAnchor="middle">Time</text>
+      </g>
+    </>
+  );
+}
+
+function chartPoints(values, max, samples, domain) {
+  return values.map((value, index) => {
+    const time = new Date(samples[index]?.createdAt || "").getTime();
+    const x = chartX(Number.isFinite(time) ? time : domain.start + index * chartTimeStepMs, domain);
+    const y = chartPlot.bottom - (Number(value || 0) / max) * chartPlot.height;
+    return `${x.toFixed(1)},${y.toFixed(1)}`;
+  }).join(" ");
+}
+
+function chartDomain(samples) {
+  const times = samples
+    .map((sample) => new Date(sample.createdAt || "").getTime())
+    .filter((time) => Number.isFinite(time));
+  const now = Date.now();
+  const minTime = times.length ? Math.min(...times) : now - chartTimeStepMs;
+  const maxTime = times.length ? Math.max(...times) : now;
+  const rawStart = Math.floor(minTime / chartTimeStepMs) * chartTimeStepMs;
+  let end = Math.ceil(maxTime / chartTimeStepMs) * chartTimeStepMs;
+  let start = Math.max(rawStart, end - chartVisibleWindowMs);
+  if (end <= start) end = start + chartTimeStepMs;
+  return { start, end };
+}
+
+function chartVisibleSamples(samples, domain) {
+  const visible = samples.filter((sample) => {
+    const time = new Date(sample.createdAt || "").getTime();
+    return Number.isFinite(time) && time >= domain.start && time <= domain.end;
+  });
+  return visible.length ? visible : samples.slice(-1);
+}
+
+function chartX(time, domain) {
+  return chartPlot.left + ((time - domain.start) / Math.max(1, domain.end - domain.start)) * chartPlot.width;
+}
+
+function chartTimeTicks(domain) {
+  const ticks = [];
+  for (let time = domain.start; time <= domain.end + 1; time += chartTimeStepMs) {
+    ticks.push({ time, label: formatChartTimeLabel(time), x: chartX(time, domain) });
+  }
+  return ticks;
+}
+
+function chartScale(max, type, unit = "") {
+  if (type === "rate") {
+    const units = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"];
+    let divisor = 1;
+    let selected = units[0];
+    for (const candidate of units) {
+      selected = candidate;
+      if (max / divisor < 1000 || candidate === units.at(-1)) break;
+      divisor *= 1000;
+    }
+    return { divisor, unit: selected };
+  }
+  return { divisor: 1, unit: unit || "value" };
+}
+
+function formatAxisValue(value, scale) {
+  const scaled = Number(value || 0) / scale.divisor;
+  if (Math.abs(scaled) >= 100) return scaled.toFixed(0);
+  if (Math.abs(scaled) >= 10) return scaled.toFixed(1);
+  return scaled.toFixed(2);
+}
+
+function formatChartTimeLabel(value) {
+  const date = new Date(value || "");
+  if (Number.isNaN(date.getTime())) return "-";
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return `${minutes}:${seconds}`;
+}
+
 function SensorTable({ sensors, devices, setRoute, showDevice = true }) {
   if (!sensors.length) return emptyState("No sensors", "Readings will appear after sensors are added.");
   const deviceName = (id) => devices.find((device) => String(device.id) === String(id))?.name || "-";
@@ -430,10 +637,10 @@ function EventsList({ events }) {
   return (
     <div className="event-list">
       {events.map((event) => (
-        <article className={`event-item ${event.status || "unknown"}`} key={event.id}>
+        <article className={`event-row ${event.status || "unknown"}`} key={event.id}>
           <span className={`dot ${event.status || "unknown"}`} />
-          <div><strong>{event.title}</strong><p>{event.message}</p></div>
-          <time>{event.createdAt}</time>
+          <div className="event-copy"><strong>{event.title}</strong><small>{event.message || "-"}</small></div>
+          <time>{formatDateTime(event.createdAt)}</time>
         </article>
       ))}
     </div>
@@ -463,17 +670,28 @@ function EventsView({ events }) {
   return <main className="single-view"><section className="panel"><div className="panel-head"><div><h2>Alerts</h2><p>Failures, warnings, and recovery events.</p></div></div><EventsList events={events} /></section></main>;
 }
 
-function SensorDetail({ sensor }) {
+function SensorDetail({ sensor, samples = [], loading = false }) {
   if (!sensor) return <main className="single-view">{emptyState("Sensor not found", "The selected sensor is not available.")}</main>;
   return (
-    <main className="single-view">
+    <main className="single-view detail-grid">
       <section className="panel identity-panel">
         <div className="detail-title"><div><h2>{sensor.name}</h2><p>{sensor.type}</p></div><StatusBadge status={sensor.status} /></div>
         <div className="detail-grid">
-          {detailRow("Value", sensor.lastValue || "-")}
+          {detailRow("Last Value", sensor.lastValue || "-")}
           {detailRow("Last Check", sensor.lastCheck || "-")}
           {detailRow("OID", sensor.oid || sensor.config?.inOid || "-")}
+          {sensor.config?.outOid && detailRow("Outbound OID", sensor.config.outOid)}
+          {sensor.config?.interfaceSpeed && detailRow("Interface Speed", formatRate(sensor.config.interfaceSpeed))}
         </div>
+      </section>
+      <section className="panel chart-panel">
+        <div className="panel-head">
+          <div>
+            <h2>Measurement History</h2>
+            <p>{sensor.type === "snmp_traffic" ? "Inbound and outbound interface rate" : "Recent sensor samples"}</p>
+          </div>
+        </div>
+        <SensorChart sensor={sensor} samples={samples} loading={loading} />
       </section>
     </main>
   );
@@ -482,17 +700,17 @@ function SensorDetail({ sensor }) {
 function Topology({ devices, setRoute }) {
   if (!devices.length) return emptyState("No devices", "Add devices to populate topology.");
   return (
-    <div className="topology-canvas">
+    <div className="topology-map topology-canvas">
       {devices.slice(0, 12).map((device, index) => {
-        const fallbackX = 16 + (index % 4) * 22;
-        const fallbackY = 18 + Math.floor(index / 4) * 24;
+        const fallbackX = 14 + (index % 4) * 24;
+        const fallbackY = 22 + Math.floor(index / 4) * 28;
         return (
           <button
             className={`topology-node ${device.status || "unknown"}`}
             key={device.id}
             style={{
-              left: `${device.topologyX ?? fallbackX}%`,
-              top: `${device.topologyY ?? fallbackY}%`,
+              left: `${clampPercent(fallbackX, 10, 90)}%`,
+              top: `${clampPercent(fallbackY, 14, 86)}%`,
             }}
             onClick={() => setRoute({ view: "device-detail", deviceId: device.id })}
           >
@@ -536,6 +754,24 @@ function PortChartLegend() {
 
 function Signal({ label, value, status }) {
   return <div className={`signal ${status}`}><span /><strong>{Number(value || 0).toLocaleString()}</strong><small>{label}</small></div>;
+}
+
+function formatDateTime(value) {
+  const date = new Date(value || "");
+  if (Number.isNaN(date.getTime())) return value || "-";
+  const year = date.getFullYear();
+  const month = String(date.getMonth() + 1).padStart(2, "0");
+  const day = String(date.getDate()).padStart(2, "0");
+  const hours = String(date.getHours()).padStart(2, "0");
+  const minutes = String(date.getMinutes()).padStart(2, "0");
+  const seconds = String(date.getSeconds()).padStart(2, "0");
+  return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}`;
+}
+
+function clampPercent(value, min, max) {
+  const number = Number(value);
+  if (!Number.isFinite(number)) return min;
+  return Math.min(max, Math.max(min, number));
 }
 
 function metricCard(label, value, caption, tone) {

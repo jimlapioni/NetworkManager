@@ -639,14 +639,21 @@ h2 {
 }
 
 .topology-empty,
-.topology-map {
+.topology-map,
+.topology-canvas {
   height: calc(100% - 65px);
+  min-height: 336px;
   position: relative;
   background:
     linear-gradient(rgba(54, 216, 255, 0.06) 1px, transparent 1px),
     linear-gradient(90deg, rgba(54, 216, 255, 0.06) 1px, transparent 1px),
     radial-gradient(circle at center, rgba(54, 216, 255, 0.1), transparent 46%);
   background-size: 32px 32px, 32px 32px, 100% 100%;
+}
+
+.topology-panel .topology-map,
+.topology-panel .topology-canvas {
+  height: calc(100% - 65px);
 }
 
 .topology-empty {
@@ -707,6 +714,7 @@ h2 {
   position: absolute;
   transform: translate(-50%, -50%);
   min-height: 32px;
+  max-width: 190px;
   border: 1px solid rgba(101, 145, 163, 0.45);
   border-radius: 999px;
   padding: 0 11px;
@@ -718,6 +726,7 @@ h2 {
   cursor: grab;
   user-select: none;
   touch-action: none;
+  white-space: nowrap;
 }
 
 .topology-node.dragging {
@@ -744,6 +753,18 @@ h2 {
 
 .topology-node.down span {
   background: var(--red);
+}
+
+.topology-node strong,
+.topology-node small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.topology-node small {
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .data-table-wrap {
@@ -935,9 +956,10 @@ tbody tr:hover {
   background: transparent;
   color: var(--text);
   padding: 10px 14px;
-  display: flex;
-  gap: 10px;
-  align-items: center;
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  gap: 4px 10px;
+  align-items: start;
   text-align: left;
 }
 
@@ -950,9 +972,31 @@ tbody tr:hover {
   display: block;
 }
 
+.event-copy {
+  min-width: 0;
+}
+
+.event-row strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .event-row small {
   color: var(--muted);
   margin-top: 4px;
+  line-height: 1.35;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+.event-row time {
+  grid-column: 2;
+  color: var(--dim);
+  font-size: 11px;
+  font-weight: 750;
+  white-space: nowrap;
+  padding-top: 0;
 }
 
 .snmp-grid {
