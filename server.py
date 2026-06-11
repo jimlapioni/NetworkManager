@@ -18,6 +18,8 @@ from urllib.parse import parse_qs, unquote, urlparse
 ROOT = Path(__file__).resolve().parent
 DB_PATH = ROOT / "data" / "network-manager.sqlite"
 DB_LOCK = threading.Lock()
+HTTP_HOST = os.environ.get("NETWORK_MANAGER_HOST", "0.0.0.0")
+HTTP_PORT = int(os.environ.get("NETWORK_MANAGER_PORT", "4173"))
 PING_TIMEOUT_MS = 1200
 SNMP_TIMEOUT_SECONDS = 2.0
 SNMP_WALK_LIMIT = 128
@@ -1347,8 +1349,9 @@ class Handler(SimpleHTTPRequestHandler):
 def main() -> None:
     init_db()
     threading.Thread(target=scheduler, daemon=True).start()
-    server = ThreadingHTTPServer(("127.0.0.1", 4173), Handler)
-    print("NetworkManager running at http://127.0.0.1:4173")
+    server = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), Handler)
+    display_host = "127.0.0.1" if HTTP_HOST in {"", "0.0.0.0"} else HTTP_HOST
+    print(f"NetworkManager running at http://{display_host}:{HTTP_PORT}")
     server.serve_forever()
 
 
