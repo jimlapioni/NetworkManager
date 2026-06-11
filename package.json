@@ -1,0 +1,33 @@
+{
+  "name": "network-manager",
+  "version": "1.0.0",
+  "description": "NetworkManager is a local NOC-style network monitoring console for small labs and office networks. It focuses on device inventory, ICMP checks, SNMP v2c sensors, and per-port traffic visibility in a PRTG-like workflow.",
+  "private": true,
+  "main": "src/main.jsx",
+  "directories": {
+    "doc": "docs"
+  },
+  "scripts": {
+    "dev": "vite --host 0.0.0.0",
+    "build": "vite build",
+    "preview": "vite preview --host 0.0.0.0"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/jimlapioni/NetworkManager.git"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "type": "module",
+  "bugs": {
+    "url": "https://github.com/jimlapioni/NetworkManager/issues"
+  },
+  "homepage": "https://github.com/jimlapioni/NetworkManager#readme",
+  "dependencies": {
+    "@vitejs/plugin-react": "^6.0.2",
+    "react": "^19.2.7",
+    "react-dom": "^19.2.7",
+    "vite": "^8.0.16"
+  }
+}
