@@ -378,6 +378,10 @@ svg {
   background: var(--gray);
   box-shadow: 0 0 0 4px rgba(126, 147, 160, 0.16);
   flex: 0 0 auto;
+  display: inline-block;
+  align-self: center;
+  position: relative;
+  top: 1px;
 }
 
 .probe-card.online .pulse,
@@ -467,7 +471,7 @@ h2 {
   width: 8px;
   height: 8px;
   border-radius: 99px;
-  margin-top: 5px;
+  align-self: center;
   background: var(--gray);
 }
 
@@ -525,6 +529,59 @@ h2 {
   background: linear-gradient(135deg, rgba(54, 216, 255, 0.95), rgba(37, 212, 138, 0.9));
   color: #061016;
   font-weight: 850;
+}
+
+.user-chip {
+  min-height: 38px;
+  border: 1px solid rgba(101, 145, 163, 0.24);
+  border-radius: 7px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.035);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.auth-shell {
+  min-height: 100vh;
+  padding: 24px;
+  display: grid;
+  place-items: center;
+  background:
+    linear-gradient(rgba(54, 216, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(54, 216, 255, 0.05) 1px, transparent 1px),
+    var(--bg);
+  background-size: 34px 34px;
+}
+
+.auth-card {
+  width: min(460px, 100%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.025)),
+    var(--panel);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
+  padding: 24px;
+  display: grid;
+  gap: 18px;
+}
+
+.auth-brand {
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.auth-card h1 {
+  margin: 4px 0 6px;
+  font-size: 28px;
+}
+
+.auth-card p {
+  margin: 0;
+  color: var(--muted);
 }
 
 .dashboard,
@@ -902,6 +959,7 @@ td {
   text-align: left;
   font-size: 13px;
   white-space: nowrap;
+  vertical-align: middle;
 }
 
 th {
@@ -931,6 +989,9 @@ tbody tr:hover {
   height: 9px;
   border-radius: 999px;
   background: var(--gray);
+  flex: 0 0 auto;
+  position: relative;
+  top: 1px;
 }
 
 .status-badge.up span {
@@ -959,7 +1020,7 @@ tbody tr:hover {
   display: grid;
   grid-template-columns: 10px minmax(0, 1fr);
   gap: 4px 10px;
-  align-items: start;
+  align-items: center;
   text-align: left;
 }
 
@@ -1082,6 +1143,12 @@ tbody tr:hover {
   grid-template-columns: 360px minmax(0, 1fr);
 }
 
+.sensor-detail-main {
+  min-width: 0;
+  display: grid;
+  gap: 14px;
+}
+
 .device-detail-view {
   grid-template-columns: minmax(0, 1fr);
 }
@@ -1120,6 +1187,115 @@ tbody tr:hover {
 
 .detail-row strong {
   overflow-wrap: anywhere;
+}
+
+.threshold-panel {
+  align-self: start;
+}
+
+.threshold-grid {
+  padding: 15px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+
+.threshold-enabled {
+  min-height: 44px;
+}
+
+.threshold-loading {
+  padding: 15px;
+  color: var(--muted);
+}
+
+.threshold-rule-list {
+  padding: 15px;
+  display: grid;
+  gap: 10px;
+}
+
+.threshold-rule-card {
+  border: 1px solid rgba(101, 145, 163, 0.24);
+  border-left: 3px solid var(--amber);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+  padding: 12px;
+  display: grid;
+  grid-template-columns: 130px repeat(5, minmax(0, 1fr)) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.threshold-rule-card.critical {
+  border-left-color: var(--red);
+}
+
+.threshold-rule-card p {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.threshold-empty {
+  min-height: 70px;
+  border: 1px dashed rgba(101, 145, 163, 0.28);
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.threshold-rule-builder {
+  margin: 0 15px 15px;
+  border: 1px solid rgba(54, 216, 255, 0.24);
+  border-radius: 8px;
+  background: rgba(54, 216, 255, 0.055);
+  padding: 12px;
+  display: grid;
+  gap: 12px;
+}
+
+.threshold-builder-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.threshold-builder-head span {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+}
+
+.threshold-builder-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.threshold-advanced-toggle {
+  justify-self: start;
+}
+
+.threshold-advanced {
+  border: 1px solid rgba(101, 145, 163, 0.24);
+  border-radius: 8px;
+  background: rgba(4, 12, 17, 0.24);
+  padding: 12px;
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(180px, 0.6fr);
+  gap: 12px;
+  align-items: end;
+}
+
+.threshold-builder-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .group-editor {
@@ -1288,7 +1464,7 @@ tbody tr:hover {
   color: var(--text);
   padding: 10px;
   display: grid;
-  grid-template-rows: auto auto minmax(28px, 1fr) 42px auto;
+  grid-template-rows: auto auto minmax(24px, 1fr) 48px auto;
   align-items: start;
   gap: 5px;
   text-align: left;
@@ -1372,7 +1548,7 @@ tbody tr:hover {
 .port-mini-chart {
   align-self: end;
   width: 100%;
-  height: 40px;
+  height: 46px;
   display: block;
 }
 
@@ -1390,7 +1566,7 @@ tbody tr:hover {
 .port-chart-in,
 .port-chart-out {
   fill: none;
-  stroke-width: 3;
+  stroke-width: 2.4;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -1447,6 +1623,23 @@ tbody tr:hover {
   padding: 14px;
   display: grid;
   gap: 12px;
+}
+
+.chart-toolbar {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.chart-axis-toggle {
+  width: min(100%, 260px);
+  min-height: 34px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 3px;
+}
+
+.chart-axis-toggle button {
+  min-height: 26px;
+  font-size: 12px;
 }
 
 .chart-stats {
@@ -1574,9 +1767,22 @@ tbody tr:hover {
 }
 
 dialog {
+  width: 100vw;
+  max-width: none;
+  height: 100dvh;
+  max-height: none;
   border: 0;
   background: transparent;
-  padding: 0;
+  padding: 154px 20px 28px;
+  margin: 0;
+  overflow: auto;
+  box-sizing: border-box;
+  z-index: 40;
+  place-items: start center;
+}
+
+dialog[open] {
+  display: grid;
 }
 
 dialog::backdrop {
@@ -1586,6 +1792,7 @@ dialog::backdrop {
 .modal-card {
   width: 620px;
   max-width: calc(100vw - 40px);
+  max-height: calc(100dvh - 182px);
   border: 1px solid var(--line);
   border-radius: 10px;
   background: #101d26;
@@ -1593,6 +1800,7 @@ dialog::backdrop {
   padding: 16px;
   display: grid;
   gap: 14px;
+  overflow: auto;
 }
 
 .modal-card.compact-modal {

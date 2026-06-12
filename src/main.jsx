@@ -3,7 +3,7 @@ import { createRoot } from "react-dom/client";
 import "../styles.css";
 
 const emptySummary = { devices: 0, sensors: 0, up: 0, warning: 0, down: 0, unknown: 0 };
-const statusLabels = { up: "Up", warning: "Warning", down: "Down", unknown: "Unknown", paused: "Paused" };
+const statusLabels = { up: "Up", warning: "Warning", down: "Critical", unknown: "Unknown", paused: "Paused" };
 const statusRank = ["down", "warning", "unknown", "paused", "up"];
 const deviceSerialNumberOid = "1.3.6.1.2.1.47.1.1.1.1.11";
 const chartPlot = { left: 82, right: 744, top: 36, bottom: 268 };
@@ -11,6 +11,7 @@ chartPlot.width = chartPlot.right - chartPlot.left;
 chartPlot.height = chartPlot.bottom - chartPlot.top;
 const chartTimeStepMs = 30 * 1000;
 const chartVisibleWindowMs = 10 * 60 * 1000;
+const authTokenStorageKey = "networkManagerAuthToken";
 
 const snmpOidGuide = [
   { name: "System Description", oid: "1.3.6.1.2.1.1.1.0", unit: "", description: "Device model, OS, firmware, or system text." },
@@ -20,13 +21,24 @@ const snmpOidGuide = [
   { name: "Interface Description", oid: "1.3.6.1.2.1.2.2.1.2.{ifIndex}", unit: "", description: "Port/interface label. Replace {ifIndex}, for example .2.1.2.1." },
 ];
 
+function authHeaders() {
+  const token = window.localStorage.getItem(authTokenStorageKey);
+  return token ? { Authorization: `Bearer ${token}` } : {};
+}
+
 async function apiRequest(path, options = {}) {
   const response = await fetch(path, {
     method: options.method || "GET",
-    headers: { Accept: "application/json", "Content-Type": "application/json" },
+    headers: { Accept: "application/json", "Content-Type": "application/json", ...authHeaders(), ...(options.headers || {}) },
     body: options.body ? JSON.stringify(options.body) : undefined,
   });
   const payload = await response.json().catch(() => ({}));
+  if (response.status === 401) {
+    const error = new Error(payload.error || "Authentication required.");
+    error.status = 401;
+    error.payload = payload;
+    throw error;
+  }
   if (!response.ok) throw new Error(payload.error || `${response.status} ${response.statusText}`);
   return payload;
 }
@@ -76,13 +88,34 @@ function icon(name) {
 function App() {
   const [route, setRouteState] = useState(() => parseRouteHash());
   const [data, setData] = useState({ loading: true, apiOnline: false, summary: emptySummary, devices: [], groups: [], sensors: [], events: [] });
+  const [auth, setAuth] = useState({ loading: true, authenticated: false, setupRequired: false, authDisabled: false, user: null, error: "" });
   const [modal, setModal] = useState(null);
   const [deviceDetailTabs, setDeviceDetailTabs] = useState({});
   const [portSamples, setPortSamples] = useState({});
   const [sensorSamples, setSensorSamples] = useState({});
   const [sensorSamplesLoading, setSensorSamplesLoading] = useState({});
+  const [sensorThresholds, setSensorThresholds] = useState({});
+  const [sensorThresholdsLoading, setSensorThresholdsLoading] = useState({});
   const [pending, setPending] = useState(null);
   const [toast, setToast] = useState("");
+
+  const loadAuth = useCallback(async () => {
+    try {
+      const payload = await apiRequest("/api/auth/me");
+      setAuth({
+        loading: false,
+        authenticated: !!payload.authenticated || !!payload.authDisabled,
+        setupRequired: !!payload.setupRequired,
+        authDisabled: !!payload.authDisabled,
+        user: payload.user || null,
+        error: "",
+      });
+      return payload;
+    } catch (error) {
+      setAuth((current) => ({ ...current, loading: false, authenticated: false, setupRequired: !!error.payload?.setupRequired, error: error.message }));
+      return null;
+    }
+  }, []);
 
   const loadData = useCallback(async ({ showLoading = false } = {}) => {
     if (showLoading) setData((current) => ({ ...current, loading: true }));
@@ -105,6 +138,10 @@ function App() {
       });
     } catch (error) {
       setData((current) => ({ ...current, loading: false, apiOnline: false }));
+      if (error.status === 401) {
+        window.localStorage.removeItem(authTokenStorageKey);
+        setAuth((current) => ({ ...current, authenticated: false, setupRequired: !!error.payload?.setupRequired, error: error.message }));
+      }
       setToast(error.message);
     }
   }, []);
@@ -120,7 +157,9 @@ function App() {
     window.history.replaceState(route, "", routeHash(route));
     const onPopState = (event) => setRouteState(event.state || parseRouteHash());
     window.addEventListener("popstate", onPopState);
-    loadData({ showLoading: true });
+    loadAuth().then((payload) => {
+      if (payload?.authDisabled || payload?.authenticated) loadData({ showLoading: true });
+    });
     return () => window.removeEventListener("popstate", onPopState);
   }, []);
 
@@ -173,18 +212,23 @@ function App() {
     let cancelled = false;
     async function refreshSensorDetail() {
       setSensorSamplesLoading((current) => ({ ...current, [sensorId]: true }));
+      setSensorThresholdsLoading((current) => ({ ...current, [sensorId]: true }));
       try {
-        const [sensors, samples] = await Promise.all([
+        const thresholdEndpoint = selectedSensor?.type === "snmp_traffic" ? "threshold-rules" : "thresholds";
+        const [sensors, samples, threshold] = await Promise.all([
           apiRequest("/api/sensors"),
           apiRequest(`/api/sensors/${sensorId}/samples`),
+          apiRequest(`/api/sensors/${sensorId}/${thresholdEndpoint}`),
         ]);
         if (cancelled) return;
         setData((current) => ({ ...current, sensors: normalizeList(sensors) }));
         setSensorSamples((current) => ({ ...current, [sensorId]: normalizeList(samples) }));
+        setSensorThresholds((current) => ({ ...current, [sensorId]: threshold }));
       } catch (error) {
         if (!cancelled) setToast(error.message);
       } finally {
         if (!cancelled) setSensorSamplesLoading((current) => ({ ...current, [sensorId]: false }));
+        if (!cancelled) setSensorThresholdsLoading((current) => ({ ...current, [sensorId]: false }));
       }
     }
     refreshSensorDetail();
@@ -193,7 +237,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [route.view, route.sensorId]);
+  }, [route.view, route.sensorId, selectedSensor?.type]);
 
   const runAction = useCallback(async (label, fn) => {
     setPending(label);
@@ -214,6 +258,18 @@ function App() {
     openModal: setModal,
     closeModal: () => setModal(null),
     refresh: () => loadData({ showLoading: false }),
+    setAuth,
+    loadAuth,
+    logout: async () => {
+      try {
+        await apiRequest("/api/auth/logout", { method: "POST" });
+      } catch {
+        // Local token removal is enough when the backend cannot be reached.
+      }
+      window.localStorage.removeItem(authTokenStorageKey);
+      setAuth({ loading: false, authenticated: false, setupRequired: false, authDisabled: false, user: null, error: "" });
+      setData((current) => ({ ...current, apiOnline: false, devices: [], groups: [], sensors: [], events: [], summary: emptySummary }));
+    },
     setRoute,
     setDeviceDetailTab: (deviceId, tab) => setDeviceDetailTabs((current) => ({ ...current, [deviceId]: tab })),
     refreshPortSamples,
@@ -249,7 +305,17 @@ function App() {
       return apiRequest(`/api/groups/${encodeURIComponent(group.name)}`, { method: "DELETE" });
     }),
     saveTopology: (deviceId, payload) => apiRequest(`/api/devices/${deviceId}/topology`, { method: "POST", body: payload }).then(() => loadData({ showLoading: false })),
-  }), [data.sensors, loadData, refreshPortSamples, runAction, setRoute]);
+    saveThreshold: (sensorId, payload) => runAction(`threshold-${sensorId}`, async () => {
+      const threshold = await apiRequest(`/api/sensors/${sensorId}/thresholds`, { method: "PUT", body: payload });
+      setSensorThresholds((current) => ({ ...current, [sensorId]: threshold }));
+      return threshold;
+    }),
+    saveThresholdRules: (sensorId, payload) => runAction(`threshold-rules-${sensorId}`, async () => {
+      const threshold = await apiRequest(`/api/sensors/${sensorId}/threshold-rules`, { method: "PUT", body: payload });
+      setSensorThresholds((current) => ({ ...current, [sensorId]: threshold }));
+      return threshold;
+    }),
+  }), [data.sensors, loadAuth, loadData, refreshPortSamples, runAction, setRoute]);
 
   const content = data.loading ? (
     <main className="single-view">{emptyState("Loading", "Fetching live network state...")}</main>
@@ -263,16 +329,23 @@ function App() {
       portSamples={portSamples}
       sensorSamples={sensorSamples}
       sensorSamplesLoading={sensorSamplesLoading}
+      sensorThresholds={sensorThresholds}
+      sensorThresholdsLoading={sensorThresholdsLoading}
       actions={actions}
       pending={pending}
     />
   );
 
+  if (auth.loading) return <main className="auth-shell">{emptyState("Loading", "Checking access...")}</main>;
+  if (!auth.authenticated || auth.setupRequired) {
+    return <AuthScreen auth={auth} setAuth={setAuth} loadData={loadData} />;
+  }
+
   return (
     <div className="noc-shell">
       <Sidebar data={data} route={route} actions={actions} />
       <div className="noc-main">
-        <Header route={route} summary={data.summary} apiOnline={data.apiOnline} actions={actions} />
+        <Header route={route} summary={data.summary} apiOnline={data.apiOnline} auth={auth} actions={actions} />
         {toast && <div className="react-toast" role="status">{toast}<button type="button" onClick={() => setToast("")}>{icon("close")}</button></div>}
         {content}
       </div>
@@ -288,12 +361,47 @@ function CurrentView(props) {
   if (props.route.view === "device-detail") return <DeviceDetail {...props} />;
   if (props.route.view === "sensor-detail") {
     const key = String(props.route.sensorId || "");
-    return <SensorDetail sensor={props.selectedSensor} samples={props.sensorSamples[key] || []} loading={!!props.sensorSamplesLoading[key]} actions={props.actions} pending={props.pending} />;
+    return <SensorDetail sensor={props.selectedSensor} samples={props.sensorSamples[key] || []} loading={!!props.sensorSamplesLoading[key]} threshold={props.sensorThresholds?.[key]} thresholdLoading={!!props.sensorThresholdsLoading?.[key]} actions={props.actions} pending={props.pending} />;
   }
   return <Dashboard {...props} />;
 }
 
-function Header({ route, summary, apiOnline, actions }) {
+function AuthScreen({ auth, setAuth, loadData }) {
+  const [form, setForm] = useState({ username: "", password: "" });
+  const [busy, setBusy] = useState(false);
+  const setup = auth.setupRequired;
+  async function submit(event) {
+    event.preventDefault();
+    setBusy(true);
+    setAuth((current) => ({ ...current, error: "" }));
+    try {
+      const payload = await apiRequest(setup ? "/api/auth/setup" : "/api/auth/login", { method: "POST", body: form });
+      window.localStorage.setItem(authTokenStorageKey, payload.token || "");
+      setAuth({ loading: false, authenticated: true, setupRequired: false, authDisabled: false, user: payload.user || null, error: "" });
+      await loadData({ showLoading: true });
+    } catch (error) {
+      setAuth((current) => ({ ...current, error: error.message }));
+    } finally {
+      setBusy(false);
+    }
+  }
+  return (
+    <main className="auth-shell">
+      <section className="auth-card">
+        <div className="brand auth-brand"><div className="brand-mark">NM</div><div><strong>NetworkManager</strong><span>NOC Console</span></div></div>
+        <div><div className="eyebrow">Secure Access</div><h1>{setup ? "Create Admin User" : "Sign In"}</h1><p>{setup ? "Create the first local administrator before opening the console." : "Sign in with your local account to manage monitoring."}</p></div>
+        <form onSubmit={submit}>
+          <label>Username<input required autoComplete="username" value={form.username} onChange={(event) => setForm((current) => ({ ...current, username: event.target.value }))} /></label>
+          <label>Password<input required type="password" minLength={setup ? 8 : 1} autoComplete={setup ? "new-password" : "current-password"} value={form.password} onChange={(event) => setForm((current) => ({ ...current, password: event.target.value }))} /></label>
+          <FormMessage error={auth.error}>{setup ? "Password must be at least 8 characters." : "Use your NetworkManager account."}</FormMessage>
+          <div className="modal-actions"><button className="primary-button" type="submit" disabled={busy}>{busy ? "Working..." : setup ? "Create Admin" : "Sign In"}</button></div>
+        </form>
+      </section>
+    </main>
+  );
+}
+
+function Header({ route, summary, apiOnline, auth, actions }) {
   const titles = { dashboard: "Command Dashboard", devices: "Device Inventory", sensors: "Sensor Console", events: "Alert Timeline", "device-detail": "Device Detail", "sensor-detail": "Sensor Detail" };
   return (
     <header className="topbar">
@@ -301,10 +409,12 @@ function Header({ route, summary, apiOnline, actions }) {
       <div className="topbar-center">
         <Signal label="Up" value={summary.up} status="up" />
         <Signal label="Warning" value={summary.warning} status="warning" />
-        <Signal label="Down" value={summary.down} status="down" />
+        <Signal label="Critical" value={summary.down} status="down" />
         <Signal label="Unknown" value={summary.unknown} status="unknown" />
       </div>
       <div className="topbar-actions">
+        {auth?.user && <span className="user-chip">{auth.user.username}</span>}
+        {!auth?.authDisabled && <button className="ghost-button" type="button" onClick={actions.logout}>Sign Out</button>}
         <button className="ghost-button" type="button" onClick={actions.refresh}>{icon("refresh")} Refresh</button>
         <button className="primary-button" type="button" onClick={() => actions.openModal({ type: "device" })}>{icon("plus")} Device</button>
       </div>
@@ -362,7 +472,7 @@ function Dashboard({ data, actions, pending }) {
       <section className="metrics-row">
         {metricCard("Devices", data.summary.devices, "Managed targets", "cyan")}
         {metricCard("Sensors", data.summary.sensors, "Ping / HTTP / SNMP", "blue")}
-        {metricCard("Alerts", (data.summary.warning || 0) + (data.summary.down || 0), "Active issues", "amber")}
+        {metricCard("Alerts", (data.summary.warning || 0) + (data.summary.down || 0), "Warning / critical", "amber")}
         {metricCard("Probe", data.apiOnline ? "Online" : "Waiting", "Backend status", data.apiOnline ? "green" : "gray")}
       </section>
       <section className="command-grid">
@@ -500,7 +610,7 @@ function EventsView({ events }) {
   return <main className="single-view"><section className="panel"><div className="panel-head"><div><h2>Alerts</h2><p>Failures, warnings, and recovery events.</p></div></div><EventsList events={events} /></section></main>;
 }
 
-function SensorDetail({ sensor, samples = [], loading = false, actions, pending }) {
+function SensorDetail({ sensor, samples = [], loading = false, threshold, thresholdLoading = false, actions, pending }) {
   if (!sensor) return <main className="single-view">{emptyState("Sensor not found", "The selected sensor is not available.")}</main>;
   return (
     <main className="single-view detail-grid">
@@ -517,11 +627,159 @@ function SensorDetail({ sensor, samples = [], loading = false, actions, pending 
         {sensor.type !== "snmp_traffic" && detailRow("OID", sensor.oid || "-")}
         {detailRow("Last Check", sensor.lastCheck || "-")}
       </section>
-      <section className="panel chart-panel">
-        <div className="panel-head"><div><h2>Measurement History</h2><p>{sensor.type === "snmp_traffic" ? "Inbound and outbound interface rate" : "Recent sensor samples"}</p></div><button className="ghost-button" type="button" disabled={pending === `check-${sensor.id}`} onClick={() => actions.checkSensor(sensor.id)}>{icon("play")} Check</button></div>
-        <SensorChart sensor={sensor} samples={samples} loading={loading} />
-      </section>
+      <div className="sensor-detail-main">
+        <section className="panel chart-panel">
+          <div className="panel-head"><div><h2>Measurement History</h2><p>{sensor.type === "snmp_traffic" ? "Inbound and outbound interface rate" : "Recent sensor samples"}</p></div><button className="ghost-button" type="button" disabled={pending === `check-${sensor.id}`} onClick={() => actions.checkSensor(sensor.id)}>{icon("play")} Check</button></div>
+          <SensorChart sensor={sensor} samples={samples} loading={loading} />
+        </section>
+        <ThresholdPanel sensor={sensor} threshold={threshold} loading={thresholdLoading} pending={pending} actions={actions} />
+      </div>
     </main>
+  );
+}
+
+function ThresholdPanel({ sensor, threshold, loading, pending, actions }) {
+  if (sensor.type === "snmp_traffic") return <PortThresholdRulesPanel sensor={sensor} threshold={threshold} loading={loading} pending={pending} actions={actions} />;
+  const defaultMetric = sensor.type === "snmp_traffic" ? "maxBps" : "value_number";
+  const [form, setForm] = useState(() => thresholdForm(threshold, defaultMetric));
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState("");
+  useEffect(() => {
+    setForm(thresholdForm(threshold, defaultMetric));
+    setError("");
+    setSaved("");
+  }, [sensor.id, threshold?.updatedAt, threshold?.metric, threshold?.enabled]);
+  const metricOptions = sensor.type === "snmp_traffic"
+    ? [
+        ["maxBps", "Max Traffic"],
+        ["inBps", "Inbound"],
+        ["outBps", "Outbound"],
+      ]
+    : [["value_number", "Numeric Value"]];
+  function update(name, value) {
+    setForm((current) => ({ ...current, [name]: value }));
+    setSaved("");
+  }
+  async function submit(event) {
+    event.preventDefault();
+    setError("");
+    setSaved("");
+    try {
+      await actions.saveThreshold(sensor.id, {
+        ...form,
+        warningValue: form.warningValue === "" ? null : Number(form.warningValue),
+        criticalValue: form.criticalValue === "" ? null : Number(form.criticalValue),
+      });
+      setSaved("Threshold saved. It will apply on the next check.");
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+  return (
+    <section className="panel threshold-panel">
+      <div className="panel-head"><div><h2>Alert Threshold</h2><p>Override sensor status when a metric crosses warning or critical limits.</p></div></div>
+      {loading ? <div className="threshold-loading">Loading threshold...</div> : (
+        <form onSubmit={submit}>
+          <div className="threshold-grid">
+            <label className="check-label threshold-enabled"><input type="checkbox" checked={form.enabled} onChange={(event) => update("enabled", event.target.checked)} /> Enable threshold</label>
+            <label>Metric<select value={form.metric} onChange={(event) => update("metric", event.target.value)}>{metricOptions.map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+            <label>Warning<select value={form.warningOperator} onChange={(event) => update("warningOperator", event.target.value)}>{operatorOptions().map(([value, label]) => <option key={`w-${value}`} value={value}>{label}</option>)}</select></label>
+            <label>Warning Value<input type="number" step="any" value={form.warningValue} onChange={(event) => update("warningValue", event.target.value)} placeholder={sensor.type === "snmp_traffic" ? "bps" : "value"} /></label>
+            <label>Critical<select value={form.criticalOperator} onChange={(event) => update("criticalOperator", event.target.value)}>{operatorOptions().map(([value, label]) => <option key={`c-${value}`} value={value}>{label}</option>)}</select></label>
+            <label>Critical Value<input type="number" step="any" value={form.criticalValue} onChange={(event) => update("criticalValue", event.target.value)} placeholder={sensor.type === "snmp_traffic" ? "bps" : "value"} /></label>
+          </div>
+          <FormMessage error={error}>{saved || thresholdHint(sensor)}</FormMessage>
+          <div className="modal-actions"><button className="primary-button" type="submit" disabled={pending === `threshold-${sensor.id}`}>{pending === `threshold-${sensor.id}` ? "Saving..." : "Save Threshold"}</button></div>
+        </form>
+      )}
+    </section>
+  );
+}
+
+function PortThresholdRulesPanel({ sensor, threshold, loading, pending, actions }) {
+  const [rules, setRules] = useState(() => normalizeThresholdRules(threshold));
+  const [draft, setDraft] = useState(() => defaultPortRule());
+  const [advanced, setAdvanced] = useState(false);
+  const [error, setError] = useState("");
+  const [saved, setSaved] = useState("");
+  useEffect(() => {
+    setRules(normalizeThresholdRules(threshold));
+    setDraft(defaultPortRule());
+    setAdvanced(false);
+    setError("");
+    setSaved("");
+  }, [sensor.id, JSON.stringify(threshold?.rules || [])]);
+  const interfaceSpeed = Number(sensor.config?.interfaceSpeed || 0);
+  function updateRule(index, patch) {
+    setRules((current) => current.map((rule, position) => position === index ? { ...rule, ...patch } : rule));
+    setSaved("");
+  }
+  function deleteRule(index) {
+    setRules((current) => current.filter((_, position) => position !== index));
+    setSaved("");
+  }
+  function updateDraft(name, value) {
+    setDraft((current) => ({ ...current, [name]: value }));
+    setSaved("");
+  }
+  function addRule() {
+    setError("");
+    const next = normalizeClientThresholdRule(draft);
+    setRules((current) => [...current, next]);
+    setDraft(defaultPortRule(draft.severity, draft.direction));
+    setAdvanced(false);
+  }
+  async function submit(event) {
+    event.preventDefault();
+    setError("");
+    setSaved("");
+    try {
+      const payloadRules = rules.map(normalizeClientThresholdRule);
+      await actions.saveThresholdRules(sensor.id, { rules: payloadRules });
+      setSaved("Threshold rules saved. They will apply on the next check.");
+    } catch (err) {
+      setError(err.message);
+    }
+  }
+  return (
+    <section className="panel threshold-panel threshold-rules-panel">
+      <div className="panel-head"><div><h2>Threshold Rules</h2><p>Use simple port-speed rules first. Advanced Mbps rules are available when needed.</p></div></div>
+      {loading ? <div className="threshold-loading">Loading threshold rules...</div> : (
+        <form onSubmit={submit}>
+          <div className="threshold-rule-list">
+            {rules.length ? rules.map((rule, index) => (
+              <article className={`threshold-rule-card ${rule.severity}`} key={rule.clientId || rule.id || index}>
+                <label className="check-label"><input type="checkbox" checked={!!rule.enabled} onChange={(event) => updateRule(index, { enabled: event.target.checked })} /> Enabled</label>
+                <select value={rule.severity} onChange={(event) => updateRule(index, { severity: event.target.value })}><option value="warning">Warning</option><option value="critical">Critical</option></select>
+                <select value={rule.metric} onChange={(event) => updateRule(index, { metric: event.target.value })}>{portMetricOptions().map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
+                <select value={rule.direction} onChange={(event) => updateRule(index, { direction: event.target.value })}><option value="above">&gt;</option><option value="below">&lt;</option></select>
+                {rule.mode === "absolute_mbps" ? <label>Mbps<input type="number" min="0" step="0.01" value={rule.absoluteMbps ?? ""} onChange={(event) => updateRule(index, { absoluteMbps: event.target.value })} /></label> : <label>Percent<input type="number" min="0" max="100" step="0.1" value={rule.percent ?? ""} onChange={(event) => updateRule(index, { percent: event.target.value })} /></label>}
+                <select value={rule.mode} onChange={(event) => updateRule(index, event.target.value === "absolute_mbps" ? { mode: "absolute_mbps", absoluteMbps: rule.absoluteMbps ?? percentToMbps(rule.percent, interfaceSpeed), percent: "" } : { mode: "percent", percent: rule.percent || 80, absoluteMbps: "" })}><option value="percent">% of port</option><option value="absolute_mbps">Mbps</option></select>
+                <button className="mini-action danger" type="button" onClick={() => deleteRule(index)}>{icon("trash")} Delete</button>
+                <p>{describeClientRule(rule, interfaceSpeed)}</p>
+              </article>
+            )) : <div className="threshold-empty">No threshold rules yet. Add a warning or critical rule below.</div>}
+          </div>
+          <section className="threshold-rule-builder">
+            <div className="threshold-builder-head"><strong>Add Rule</strong><span>{describeClientRule(draft, interfaceSpeed)}</span></div>
+            <div className="threshold-builder-grid">
+              <label>Rule Type<select value={draft.direction} onChange={(event) => updateDraft("direction", event.target.value)}><option value="above">High usage (&gt;)</option><option value="below">Low usage (&lt;)</option></select></label>
+              <label>Severity<select value={draft.severity} onChange={(event) => updateDraft("severity", event.target.value)}><option value="warning">Warning</option><option value="critical">Critical</option></select></label>
+              <label>Metric<select value={draft.metric} onChange={(event) => updateDraft("metric", event.target.value)}>{portMetricOptions().map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+              <label>Percent<input type="number" min="0" max="100" step="0.1" value={draft.percent} onChange={(event) => updateDraft("percent", event.target.value)} /></label>
+            </div>
+            <button className="ghost-button threshold-advanced-toggle" type="button" onClick={() => setAdvanced((current) => !current)}>{advanced ? "Hide Advanced" : "Advanced option"}</button>
+            {advanced && <div className="threshold-advanced">
+              <label className="check-label"><input type="checkbox" checked={draft.mode === "absolute_mbps"} onChange={(event) => setDraft((current) => event.target.checked ? { ...current, mode: "absolute_mbps", absoluteMbps: current.absoluteMbps || percentToMbps(current.percent, interfaceSpeed) } : { ...current, mode: "percent" })} /> Use specific Mbps instead of percent</label>
+              {draft.mode === "absolute_mbps" && <label>Specific Mbps<input type="number" min="0" step="0.01" value={draft.absoluteMbps ?? ""} onChange={(event) => updateDraft("absoluteMbps", event.target.value)} placeholder="950" /></label>}
+            </div>}
+            <div className="threshold-builder-actions"><button className="primary-button" type="button" onClick={addRule}>{icon("plus")} Add Rule</button></div>
+          </section>
+          <FormMessage error={error}>{saved || "Critical uses the existing red status internally; the UI displays it as Critical."}</FormMessage>
+          <div className="modal-actions"><button className="primary-button" type="submit" disabled={pending === `threshold-rules-${sensor.id}`}>{pending === `threshold-rules-${sensor.id}` ? "Saving..." : "Save Rules"}</button></div>
+        </form>
+      )}
+    </section>
   );
 }
 
@@ -839,17 +1097,21 @@ function PortMiniChart({ samples }) {
 }
 
 function SensorChart({ sensor, samples, loading }) {
+  const [trafficAxisMode, setTrafficAxisMode] = useState("port_speed");
+  useEffect(() => setTrafficAxisMode("port_speed"), [sensor.id]);
   if (loading) return <div className="empty-chart"><span>Loading samples</span></div>;
   if (!samples.length) return <div className="empty-chart"><span>No samples yet</span></div>;
   const domain = chartDomain(samples);
   const visibleSamples = chartVisibleSamples(samples, domain);
   if (sensor.type === "snmp_traffic") {
     const points = visibleSamples.map((sample) => ({ inBps: Number(sample.meta?.inBps || 0), outBps: Number(sample.meta?.outBps || 0) }));
-    const measuredMax = Math.max(1, ...points.flatMap((item) => [item.inBps, item.outBps]));
+    const measuredMax = Math.max(0, ...points.flatMap((item) => [item.inBps, item.outBps]));
     const interfaceSpeed = Number(sensor.config?.interfaceSpeed || visibleSamples.at(-1)?.meta?.interfaceSpeed || 0);
-    const axisMax = Math.max(1, interfaceSpeed || measuredMax, measuredMax);
+    const axisMax = trafficAxisMode === "auto_peak"
+      ? niceAxisMax(measuredMax)
+      : Math.max(1, interfaceSpeed || measuredMax, measuredMax);
     const scale = chartScale(axisMax, "rate");
-    return <div className="traffic-chart"><div className="chart-stats"><div><span>Inbound</span><strong>{formatRate(points.at(-1)?.inBps || 0)}</strong></div><div><span>Outbound</span><strong>{formatRate(points.at(-1)?.outBps || 0)}</strong></div><div><span>Peak</span><strong>{formatRate(measuredMax)}</strong></div><div><span>Axis Max</span><strong>{formatRate(axisMax)}</strong></div></div><svg viewBox="0 0 780 330" role="img" aria-label="Interface traffic history"><ChartGrid max={axisMax} scale={scale} domain={domain} /><polyline className="chart-line in" points={chartPoints(points.map((item) => item.inBps), axisMax, visibleSamples, domain)} /><polyline className="chart-line out" points={chartPoints(points.map((item) => item.outBps), axisMax, visibleSamples, domain)} /></svg><div className="chart-legend"><span><i className="legend-in" />Inbound</span><span><i className="legend-out" />Outbound</span></div></div>;
+    return <div className="traffic-chart"><div className="chart-toolbar"><div className="segmented-control chart-axis-toggle" aria-label="Y axis display mode"><button className={trafficAxisMode === "port_speed" ? "active" : ""} type="button" onClick={() => setTrafficAxisMode("port_speed")}>Port Speed</button><button className={trafficAxisMode === "auto_peak" ? "active" : ""} type="button" onClick={() => setTrafficAxisMode("auto_peak")}>Auto Peak</button></div></div><div className="chart-stats"><div><span>Inbound</span><strong>{formatRate(points.at(-1)?.inBps || 0)}</strong></div><div><span>Outbound</span><strong>{formatRate(points.at(-1)?.outBps || 0)}</strong></div><div><span>Peak</span><strong>{formatRate(measuredMax)}</strong></div><div><span>Axis Max</span><strong>{formatRate(axisMax)}</strong></div></div><svg viewBox="0 0 780 330" role="img" aria-label="Interface traffic history"><ChartGrid max={axisMax} scale={scale} domain={domain} /><polyline className="chart-line in" points={chartPoints(points.map((item) => item.inBps), axisMax, visibleSamples, domain)} /><polyline className="chart-line out" points={chartPoints(points.map((item) => item.outBps), axisMax, visibleSamples, domain)} /></svg><div className="chart-legend"><span><i className="legend-in" />Inbound</span><span><i className="legend-out" />Outbound</span></div></div>;
   }
   const values = visibleSamples.map((sample) => Number(sample.valueNumber || 0));
   const max = Math.max(1, ...values);
@@ -861,6 +1123,99 @@ function ChartGrid({ max, scale, domain }) {
   const yTicks = [1, 0.75, 0.5, 0.25, 0];
   const timeTicks = chartTimeTicks(domain);
   return <><g className="chart-grid"><line x1={chartPlot.left} y1={chartPlot.top} x2={chartPlot.left} y2={chartPlot.bottom} /><line x1={chartPlot.left} y1={chartPlot.bottom} x2={chartPlot.right} y2={chartPlot.bottom} />{timeTicks.map((tick) => <line key={`x-${tick.time}`} x1={tick.x} y1={chartPlot.top} x2={tick.x} y2={chartPlot.bottom} />)}{yTicks.map((ratio) => { const y = chartPlot.bottom - ratio * chartPlot.height; return <line key={`y-${ratio}`} x1={chartPlot.left} y1={y} x2={chartPlot.right} y2={y} />; })}</g><g className="chart-axis-labels">{yTicks.map((ratio) => { const y = chartPlot.bottom - ratio * chartPlot.height; return <text key={`yl-${ratio}`} x={chartPlot.left - 10} y={y + 4} textAnchor="end">{formatAxisValue(max * ratio, scale)}</text>; })}{timeTicks.map((tick) => <text className="chart-time-label" key={`tl-${tick.time}`} x={tick.x} y="294" textAnchor="middle">{tick.label}</text>)}<text className="chart-axis-title" x={chartPlot.left} y="20" textAnchor="start">{scale.unit}</text><text className="chart-axis-title" x={(chartPlot.left + chartPlot.right) / 2} y="320" textAnchor="middle">Time</text></g></>;
+}
+
+function thresholdForm(threshold, defaultMetric) {
+  return {
+    enabled: !!threshold?.enabled,
+    metric: threshold?.metric || defaultMetric,
+    warningOperator: threshold?.warningOperator || "",
+    warningValue: threshold?.warningValue ?? "",
+    criticalOperator: threshold?.criticalOperator || "",
+    criticalValue: threshold?.criticalValue ?? "",
+  };
+}
+
+function portMetricOptions() {
+  return [
+    ["maxBps", "Max Traffic"],
+    ["inBps", "Inbound"],
+    ["outBps", "Outbound"],
+  ];
+}
+
+function defaultPortRule(severity = "warning", direction = "above") {
+  const percent = direction === "below" ? (severity === "critical" ? 1 : 5) : (severity === "critical" ? 95 : 80);
+  return {
+    clientId: `draft-${Date.now()}-${Math.random().toString(16).slice(2)}`,
+    enabled: true,
+    severity,
+    metric: "maxBps",
+    direction,
+    mode: "percent",
+    percent,
+    absoluteMbps: "",
+    label: "",
+  };
+}
+
+function normalizeThresholdRules(threshold) {
+  return (threshold?.rules || []).map((rule) => normalizeClientThresholdRule(rule));
+}
+
+function normalizeClientThresholdRule(rule) {
+  const mode = rule.mode === "absolute_mbps" ? "absolute_mbps" : "percent";
+  return {
+    id: rule.id,
+    clientId: rule.clientId || `rule-${rule.id || Date.now()}-${Math.random().toString(16).slice(2)}`,
+    enabled: rule.enabled !== false,
+    severity: rule.severity === "critical" ? "critical" : "warning",
+    metric: ["maxBps", "inBps", "outBps"].includes(rule.metric) ? rule.metric : "maxBps",
+    direction: rule.direction === "below" ? "below" : "above",
+    mode,
+    percent: mode === "percent" ? Number(rule.percent ?? 80) : "",
+    absoluteMbps: mode === "absolute_mbps" ? Number(rule.absoluteMbps ?? rule.absolute_mbps ?? 0) : "",
+    label: rule.label || "",
+  };
+}
+
+function percentToMbps(percent, interfaceSpeed) {
+  const bps = Number(interfaceSpeed || 0) * Number(percent || 0) / 100;
+  return Number.isFinite(bps) ? Number((bps / 1_000_000).toFixed(2)) : "";
+}
+
+function ruleLimitBps(rule, interfaceSpeed) {
+  if (rule.mode === "absolute_mbps") return Number(rule.absoluteMbps || 0) * 1_000_000;
+  return Number(interfaceSpeed || 0) * Number(rule.percent || 0) / 100;
+}
+
+function describeClientRule(rule, interfaceSpeed) {
+  const metric = Object.fromEntries(portMetricOptions())[rule.metric] || "Max Traffic";
+  const severity = rule.severity === "critical" ? "Critical" : "Warning";
+  const sign = rule.direction === "below" ? "<" : ">";
+  const target = rule.mode === "absolute_mbps"
+    ? `${Number(rule.absoluteMbps || 0).toLocaleString()} Mbps`
+    : `${Number(rule.percent || 0).toLocaleString()}% of ${formatRate(interfaceSpeed || 0)}`;
+  const limit = ruleLimitBps(rule, interfaceSpeed);
+  const converted = limit ? ` (${formatRate(limit)})` : "";
+  return `${severity} when ${metric} ${sign} ${target}${converted}`;
+}
+
+function operatorOptions() {
+  return [
+    ["", "Disabled"],
+    [">", ">"],
+    [">=", ">="],
+    ["<", "<"],
+    ["<=", "<="],
+    ["==", "=="],
+    ["!=", "!="],
+  ];
+}
+
+function thresholdHint(sensor) {
+  if (sensor.type === "snmp_traffic") return "Traffic thresholds use bps values. Example: 800000000 for 800 Mbps.";
+  return "Numeric thresholds apply to the parsed sample value. Text-only SNMP values will not trigger numeric thresholds.";
 }
 
 function groupDevices(groups, devices) {
@@ -935,10 +1290,13 @@ function emptyState(title, body) {
 }
 
 function miniChartPoints(values, max, width, height) {
-  if (values.length < 2 || max <= 0) return `0,${height - 4} ${width},${height - 4}`;
+  const topPadding = 6;
+  const bottomPadding = 6;
+  const baseline = height - bottomPadding;
+  if (values.length < 2 || max <= 0) return `0,${baseline} ${width},${baseline}`;
   return values.map((value, index) => {
     const x = (index / Math.max(1, values.length - 1)) * width;
-    const y = height - 4 - (Number(value || 0) / max) * (height - 8);
+    const y = baseline - (Number(value || 0) / max) * (height - topPadding - bottomPadding);
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(" ");
 }
@@ -995,6 +1353,17 @@ function chartScale(max, type, unit = "") {
     return { divisor, unit: selected };
   }
   return { divisor: 1, unit: unit || "value" };
+}
+
+function niceAxisMax(value) {
+  const number = Number(value || 0);
+  if (!Number.isFinite(number) || number <= 0) return 1;
+  const padded = number * 1.12;
+  const exponent = Math.floor(Math.log10(padded));
+  const base = 10 ** exponent;
+  const normalized = padded / base;
+  const step = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
+  return step * base;
 }
 
 function formatRate(value) {
