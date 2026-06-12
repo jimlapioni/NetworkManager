@@ -378,6 +378,10 @@ svg {
   background: var(--gray);
   box-shadow: 0 0 0 4px rgba(126, 147, 160, 0.16);
   flex: 0 0 auto;
+  display: inline-block;
+  align-self: center;
+  position: relative;
+  top: 1px;
 }
 
 .probe-card.online .pulse,
@@ -467,7 +471,7 @@ h2 {
   width: 8px;
   height: 8px;
   border-radius: 99px;
-  margin-top: 5px;
+  align-self: center;
   background: var(--gray);
 }
 
@@ -525,6 +529,59 @@ h2 {
   background: linear-gradient(135deg, rgba(54, 216, 255, 0.95), rgba(37, 212, 138, 0.9));
   color: #061016;
   font-weight: 850;
+}
+
+.user-chip {
+  min-height: 38px;
+  border: 1px solid rgba(101, 145, 163, 0.24);
+  border-radius: 7px;
+  padding: 0 10px;
+  display: inline-flex;
+  align-items: center;
+  color: var(--muted);
+  background: rgba(255, 255, 255, 0.035);
+  font-size: 13px;
+  font-weight: 800;
+}
+
+.auth-shell {
+  min-height: 100vh;
+  padding: 24px;
+  display: grid;
+  place-items: center;
+  background:
+    linear-gradient(rgba(54, 216, 255, 0.05) 1px, transparent 1px),
+    linear-gradient(90deg, rgba(54, 216, 255, 0.05) 1px, transparent 1px),
+    var(--bg);
+  background-size: 34px 34px;
+}
+
+.auth-card {
+  width: min(460px, 100%);
+  border: 1px solid var(--line);
+  border-radius: 8px;
+  background:
+    linear-gradient(180deg, rgba(255, 255, 255, 0.06), rgba(255, 255, 255, 0.025)),
+    var(--panel);
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.34);
+  padding: 24px;
+  display: grid;
+  gap: 18px;
+}
+
+.auth-brand {
+  padding-bottom: 16px;
+  border-bottom: 1px solid var(--line-soft);
+}
+
+.auth-card h1 {
+  margin: 4px 0 6px;
+  font-size: 28px;
+}
+
+.auth-card p {
+  margin: 0;
+  color: var(--muted);
 }
 
 .dashboard,
@@ -639,14 +696,21 @@ h2 {
 }
 
 .topology-empty,
-.topology-map {
+.topology-map,
+.topology-canvas {
   height: calc(100% - 65px);
+  min-height: 336px;
   position: relative;
   background:
     linear-gradient(rgba(54, 216, 255, 0.06) 1px, transparent 1px),
     linear-gradient(90deg, rgba(54, 216, 255, 0.06) 1px, transparent 1px),
     radial-gradient(circle at center, rgba(54, 216, 255, 0.1), transparent 46%);
   background-size: 32px 32px, 32px 32px, 100% 100%;
+}
+
+.topology-panel .topology-map,
+.topology-panel .topology-canvas {
+  height: calc(100% - 65px);
 }
 
 .topology-empty {
@@ -707,6 +771,7 @@ h2 {
   position: absolute;
   transform: translate(-50%, -50%);
   min-height: 32px;
+  max-width: 190px;
   border: 1px solid rgba(101, 145, 163, 0.45);
   border-radius: 999px;
   padding: 0 11px;
@@ -718,6 +783,7 @@ h2 {
   cursor: grab;
   user-select: none;
   touch-action: none;
+  white-space: nowrap;
 }
 
 .topology-node.dragging {
@@ -744,6 +810,18 @@ h2 {
 
 .topology-node.down span {
   background: var(--red);
+}
+
+.topology-node strong,
+.topology-node small {
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.topology-node small {
+  color: var(--muted);
+  font-size: 11px;
 }
 
 .data-table-wrap {
@@ -881,6 +959,7 @@ td {
   text-align: left;
   font-size: 13px;
   white-space: nowrap;
+  vertical-align: middle;
 }
 
 th {
@@ -910,6 +989,9 @@ tbody tr:hover {
   height: 9px;
   border-radius: 999px;
   background: var(--gray);
+  flex: 0 0 auto;
+  position: relative;
+  top: 1px;
 }
 
 .status-badge.up span {
@@ -935,8 +1017,9 @@ tbody tr:hover {
   background: transparent;
   color: var(--text);
   padding: 10px 14px;
-  display: flex;
-  gap: 10px;
+  display: grid;
+  grid-template-columns: 10px minmax(0, 1fr);
+  gap: 4px 10px;
   align-items: center;
   text-align: left;
 }
@@ -950,9 +1033,31 @@ tbody tr:hover {
   display: block;
 }
 
+.event-copy {
+  min-width: 0;
+}
+
+.event-row strong {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .event-row small {
   color: var(--muted);
   margin-top: 4px;
+  line-height: 1.35;
+  word-break: normal;
+  overflow-wrap: anywhere;
+}
+
+.event-row time {
+  grid-column: 2;
+  color: var(--dim);
+  font-size: 11px;
+  font-weight: 750;
+  white-space: nowrap;
+  padding-top: 0;
 }
 
 .snmp-grid {
@@ -1038,6 +1143,12 @@ tbody tr:hover {
   grid-template-columns: 360px minmax(0, 1fr);
 }
 
+.sensor-detail-main {
+  min-width: 0;
+  display: grid;
+  gap: 14px;
+}
+
 .device-detail-view {
   grid-template-columns: minmax(0, 1fr);
 }
@@ -1076,6 +1187,115 @@ tbody tr:hover {
 
 .detail-row strong {
   overflow-wrap: anywhere;
+}
+
+.threshold-panel {
+  align-self: start;
+}
+
+.threshold-grid {
+  padding: 15px;
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 12px;
+  align-items: end;
+}
+
+.threshold-enabled {
+  min-height: 44px;
+}
+
+.threshold-loading {
+  padding: 15px;
+  color: var(--muted);
+}
+
+.threshold-rule-list {
+  padding: 15px;
+  display: grid;
+  gap: 10px;
+}
+
+.threshold-rule-card {
+  border: 1px solid rgba(101, 145, 163, 0.24);
+  border-left: 3px solid var(--amber);
+  border-radius: 8px;
+  background: rgba(255, 255, 255, 0.035);
+  padding: 12px;
+  display: grid;
+  grid-template-columns: 130px repeat(5, minmax(0, 1fr)) auto;
+  gap: 10px;
+  align-items: end;
+}
+
+.threshold-rule-card.critical {
+  border-left-color: var(--red);
+}
+
+.threshold-rule-card p {
+  grid-column: 1 / -1;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.35;
+}
+
+.threshold-empty {
+  min-height: 70px;
+  border: 1px dashed rgba(101, 145, 163, 0.28);
+  border-radius: 8px;
+  display: grid;
+  place-items: center;
+  color: var(--muted);
+  font-size: 13px;
+}
+
+.threshold-rule-builder {
+  margin: 0 15px 15px;
+  border: 1px solid rgba(54, 216, 255, 0.24);
+  border-radius: 8px;
+  background: rgba(54, 216, 255, 0.055);
+  padding: 12px;
+  display: grid;
+  gap: 12px;
+}
+
+.threshold-builder-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 14px;
+}
+
+.threshold-builder-head span {
+  color: var(--muted);
+  font-size: 12px;
+  text-align: right;
+}
+
+.threshold-builder-grid {
+  display: grid;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  gap: 12px;
+}
+
+.threshold-advanced-toggle {
+  justify-self: start;
+}
+
+.threshold-advanced {
+  border: 1px solid rgba(101, 145, 163, 0.24);
+  border-radius: 8px;
+  background: rgba(4, 12, 17, 0.24);
+  padding: 12px;
+  display: grid;
+  grid-template-columns: minmax(220px, 1fr) minmax(180px, 0.6fr);
+  gap: 12px;
+  align-items: end;
+}
+
+.threshold-builder-actions {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .group-editor {
@@ -1244,7 +1464,7 @@ tbody tr:hover {
   color: var(--text);
   padding: 10px;
   display: grid;
-  grid-template-rows: auto auto minmax(28px, 1fr) 42px auto;
+  grid-template-rows: auto auto minmax(24px, 1fr) 48px auto;
   align-items: start;
   gap: 5px;
   text-align: left;
@@ -1328,7 +1548,7 @@ tbody tr:hover {
 .port-mini-chart {
   align-self: end;
   width: 100%;
-  height: 40px;
+  height: 46px;
   display: block;
 }
 
@@ -1346,7 +1566,7 @@ tbody tr:hover {
 .port-chart-in,
 .port-chart-out {
   fill: none;
-  stroke-width: 3;
+  stroke-width: 2.4;
   stroke-linecap: round;
   stroke-linejoin: round;
 }
@@ -1403,6 +1623,23 @@ tbody tr:hover {
   padding: 14px;
   display: grid;
   gap: 12px;
+}
+
+.chart-toolbar {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.chart-axis-toggle {
+  width: min(100%, 260px);
+  min-height: 34px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  padding: 3px;
+}
+
+.chart-axis-toggle button {
+  min-height: 26px;
+  font-size: 12px;
 }
 
 .chart-stats {
@@ -1530,9 +1767,22 @@ tbody tr:hover {
 }
 
 dialog {
+  width: 100vw;
+  max-width: none;
+  height: 100dvh;
+  max-height: none;
   border: 0;
   background: transparent;
-  padding: 0;
+  padding: 154px 20px 28px;
+  margin: 0;
+  overflow: auto;
+  box-sizing: border-box;
+  z-index: 40;
+  place-items: start center;
+}
+
+dialog[open] {
+  display: grid;
 }
 
 dialog::backdrop {
@@ -1542,6 +1792,7 @@ dialog::backdrop {
 .modal-card {
   width: 620px;
   max-width: calc(100vw - 40px);
+  max-height: calc(100dvh - 182px);
   border: 1px solid var(--line);
   border-radius: 10px;
   background: #101d26;
@@ -1549,6 +1800,7 @@ dialog::backdrop {
   padding: 16px;
   display: grid;
   gap: 14px;
+  overflow: auto;
 }
 
 .modal-card.compact-modal {
@@ -1836,7 +2088,7 @@ dialog::backdrop {
 .segmented-control {
   min-height: 40px;
   display: grid;
-  grid-template-columns: repeat(3, minmax(0, 1fr));
+  grid-template-columns: repeat(auto-fit, minmax(140px, 1fr));
   gap: 6px;
   padding: 4px;
   border: 1px solid var(--line);
@@ -1847,6 +2099,28 @@ dialog::backdrop {
 .segmented-control label {
   min-width: 0;
   display: block;
+}
+
+.segmented-control button {
+  min-width: 0;
+  min-height: 32px;
+  border: 0;
+  border-radius: 6px;
+  background: transparent;
+  color: var(--muted);
+  font-weight: 850;
+  padding: 0 10px;
+}
+
+.segmented-control button:hover,
+.segmented-control button:focus-visible {
+  background: rgba(54, 216, 255, 0.1);
+  color: var(--text);
+}
+
+.segmented-control button.active {
+  background: linear-gradient(135deg, rgba(54, 216, 255, 0.95), rgba(37, 212, 138, 0.88));
+  color: #061016;
 }
 
 .segmented-control input {
@@ -1956,6 +2230,45 @@ textarea:focus {
   border-radius: 8px;
   padding: 10px 12px;
   font-size: 13px;
+}
+
+.modal-note.error {
+  border-color: rgba(242, 95, 92, 0.42);
+  background: rgba(242, 95, 92, 0.1);
+  color: #ffb2b0;
+}
+
+.react-toast {
+  position: fixed;
+  right: 22px;
+  bottom: 22px;
+  z-index: 30;
+  max-width: 420px;
+  border: 1px solid rgba(242, 95, 92, 0.42);
+  border-radius: 8px;
+  background: rgba(31, 44, 54, 0.96);
+  color: #ffcfcd;
+  box-shadow: 0 18px 42px rgba(0, 0, 0, 0.34);
+  padding: 10px 12px;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+}
+
+.react-toast button {
+  width: 24px;
+  height: 24px;
+  min-height: 24px;
+  border: 0;
+  background: transparent;
+  color: inherit;
+  padding: 0;
+}
+
+.react-toast svg {
+  width: 14px;
+  height: 14px;
 }
 
 .sensor-type-grid {

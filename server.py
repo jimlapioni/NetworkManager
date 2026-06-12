@@ -4,18 +4,28 @@ import json
 import os
 import random
 import re
+import base64
+import hashlib
+import hmac
 import socket
 import sqlite3
+import smtplib
+import ssl
 import subprocess
+import secrets
 import threading
 import time
 from datetime import datetime, timezone
+from email.message import EmailMessage
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlparse
+from urllib import request as urlrequest
+from urllib import error as urlerror
 
 
 ROOT = Path(__file__).resolve().parent
+DIST_PATH = ROOT / "dist"
 DB_PATH = ROOT / "data" / "network-manager.sqlite"
 DB_LOCK = threading.Lock()
 HTTP_HOST = os.environ.get("NETWORK_MANAGER_HOST", "0.0.0.0")
@@ -23,11 +33,22 @@ HTTP_PORT = int(os.environ.get("NETWORK_MANAGER_PORT", "4173"))
 PING_TIMEOUT_MS = 1200
 SNMP_TIMEOUT_SECONDS = 2.0
 SNMP_WALK_LIMIT = 128
+SNMP_TABLE_WALK_LIMIT = 4096
+SENSOR_BATCH_LIMIT = 8
+TRAFFIC_DEVICE_BATCH_LIMIT = 2
+AUTH_DISABLED = os.environ.get("NETWORK_MANAGER_AUTH_DISABLED", "").lower() in {"1", "true", "yes", "on"}
+PASSWORD_ITERATIONS = 210_000
 IF_DESCR_OID = "1.3.6.1.2.1.2.2.1.2"
 IF_SPEED_OID = "1.3.6.1.2.1.2.2.1.5"
 IF_ALIAS_OID = "1.3.6.1.2.1.31.1.1.1.18"
 IF_HC_IN_OID = "1.3.6.1.2.1.31.1.1.1.6"
 IF_HC_OUT_OID = "1.3.6.1.2.1.31.1.1.1.10"
+TRAFFIC_POLL_LOCK = threading.Lock()
+TRAFFIC_POLL_DEVICES: set[int] = set()
+
+
+def static_root() -> Path:
+    return DIST_PATH if (DIST_PATH / "index.html").exists() else ROOT
 
 
 def now_iso() -> str:
@@ -102,18 +123,285 @@ def init_db() -> None:
                 created_at TEXT NOT NULL,
                 FOREIGN KEY(sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
             );
+
+            CREATE TABLE IF NOT EXISTS users (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                username TEXT NOT NULL UNIQUE,
+                password_hash TEXT NOT NULL,
+                role TEXT NOT NULL DEFAULT 'admin',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS api_tokens (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                user_id INTEGER NOT NULL,
+                name TEXT NOT NULL,
+                token_hash TEXT NOT NULL UNIQUE,
+                last_used_at TEXT NOT NULL DEFAULT '',
+                expires_at TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS sensor_thresholds (
+                sensor_id INTEGER PRIMARY KEY,
+                metric TEXT NOT NULL DEFAULT 'value_number',
+                warning_operator TEXT NOT NULL DEFAULT '',
+                warning_value REAL,
+                critical_operator TEXT NOT NULL DEFAULT '',
+                critical_value REAL,
+                enabled INTEGER NOT NULL DEFAULT 0,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS sensor_threshold_rules (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sensor_id INTEGER NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                severity TEXT NOT NULL,
+                metric TEXT NOT NULL,
+                direction TEXT NOT NULL,
+                mode TEXT NOT NULL,
+                percent REAL,
+                absolute_mbps REAL,
+                label TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS notification_channels (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                name TEXT NOT NULL,
+                type TEXT NOT NULL,
+                enabled INTEGER NOT NULL DEFAULT 1,
+                config_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS notification_deliveries (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                channel_id INTEGER NOT NULL,
+                event_id INTEGER NOT NULL,
+                status TEXT NOT NULL,
+                response TEXT NOT NULL DEFAULT '',
+                status_code INTEGER,
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(channel_id) REFERENCES notification_channels(id) ON DELETE CASCADE,
+                FOREIGN KEY(event_id) REFERENCES events(id) ON DELETE CASCADE
+            );
+
+            CREATE TABLE IF NOT EXISTS sample_rollups (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                sensor_id INTEGER NOT NULL,
+                bucket TEXT NOT NULL,
+                bucket_start TEXT NOT NULL,
+                status TEXT NOT NULL,
+                avg_value REAL,
+                min_value REAL,
+                max_value REAL,
+                sample_count INTEGER NOT NULL,
+                meta_json TEXT NOT NULL DEFAULT '{}',
+                created_at TEXT NOT NULL,
+                UNIQUE(sensor_id, bucket, bucket_start),
+                FOREIGN KEY(sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
+            );
             """
         )
         ensure_column(connection, "devices", "topology_x", "REAL")
         ensure_column(connection, "devices", "topology_y", "REAL")
         ensure_column(connection, "samples", "meta_json", "TEXT NOT NULL DEFAULT '{}'")
         sync_groups_from_devices(connection)
+        bootstrap_admin_from_env(connection)
 
 
 def ensure_column(connection: sqlite3.Connection, table: str, column: str, definition: str) -> None:
     columns = [row["name"] for row in connection.execute(f"PRAGMA table_info({table})").fetchall()]
     if column not in columns:
         connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
+def hash_password(password: str) -> str:
+    salt = secrets.token_hex(16)
+    digest = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), PASSWORD_ITERATIONS)
+    return f"pbkdf2_sha256${PASSWORD_ITERATIONS}${salt}${digest.hex()}"
+
+
+def verify_password(password: str, stored: str) -> bool:
+    try:
+        algorithm, iterations, salt, digest = stored.split("$", 3)
+        if algorithm != "pbkdf2_sha256":
+            return False
+        candidate = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), int(iterations)).hex()
+        return hmac.compare_digest(candidate, digest)
+    except Exception:
+        return False
+
+
+def token_hash(token: str) -> str:
+    return hashlib.sha256(token.encode("utf-8")).hexdigest()
+
+
+def row_to_user(row: sqlite3.Row | None) -> dict | None:
+    if not row:
+        return None
+    return {"id": row["id"], "username": row["username"], "role": row["role"], "createdAt": row["created_at"]}
+
+
+def users_exist(connection: sqlite3.Connection | None = None) -> bool:
+    if connection is not None:
+        return bool(connection.execute("SELECT 1 FROM users LIMIT 1").fetchone())
+    with DB_LOCK, db() as check_connection:
+        return users_exist(check_connection)
+
+
+def auth_setup_required() -> bool:
+    if AUTH_DISABLED:
+        return False
+    return not users_exist()
+
+
+def bootstrap_admin_from_env(connection: sqlite3.Connection) -> None:
+    username = os.environ.get("NETWORK_MANAGER_ADMIN_USER", "").strip()
+    password = os.environ.get("NETWORK_MANAGER_ADMIN_PASSWORD", "")
+    if not username or not password:
+        return
+    existing = connection.execute("SELECT id FROM users WHERE username = ?", (username,)).fetchone()
+    if existing:
+        return
+    created_at = now_iso()
+    connection.execute(
+        "INSERT INTO users (username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'admin', ?, ?)",
+        (username, hash_password(password), created_at, created_at),
+    )
+
+
+def create_initial_admin(payload: dict) -> dict:
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    if not username or len(password) < 8:
+        raise ValueError("Username and a password of at least 8 characters are required.")
+    with DB_LOCK, db() as connection:
+        if users_exist(connection):
+            raise ValueError("Initial setup is already complete.")
+        created_at = now_iso()
+        cursor = connection.execute(
+            "INSERT INTO users (username, password_hash, role, created_at, updated_at) VALUES (?, ?, 'admin', ?, ?)",
+            (username, hash_password(password), created_at, created_at),
+        )
+        row = connection.execute("SELECT * FROM users WHERE id = ?", (cursor.lastrowid,)).fetchone()
+    login_payload = create_login_token(row["id"], "browser session")
+    return {"ok": True, "user": row_to_user(row), "token": login_payload["token"]}
+
+
+def create_login_token(user_id: int, name: str) -> dict:
+    raw_token = secrets.token_urlsafe(32)
+    created_at = now_iso()
+    with DB_LOCK, db() as connection:
+        connection.execute(
+            "INSERT INTO api_tokens (user_id, name, token_hash, created_at) VALUES (?, ?, ?, ?)",
+            (user_id, name, token_hash(raw_token), created_at),
+        )
+    return {"token": raw_token}
+
+
+def login_user(payload: dict) -> dict:
+    username = str(payload.get("username") or "").strip()
+    password = str(payload.get("password") or "")
+    with DB_LOCK, db() as connection:
+        row = connection.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if not row or not verify_password(password, row["password_hash"]):
+        raise ValueError("Invalid username or password.")
+    token = create_login_token(int(row["id"]), "browser session")["token"]
+    return {"ok": True, "token": token, "user": row_to_user(row)}
+
+
+def logout_token(token: str) -> dict:
+    if token:
+        with DB_LOCK, db() as connection:
+            connection.execute("DELETE FROM api_tokens WHERE token_hash = ?", (token_hash(token),))
+    return {"ok": True}
+
+
+def authenticate_basic(header: str) -> dict | None:
+    try:
+        encoded = header.split(" ", 1)[1]
+        decoded = base64.b64decode(encoded).decode("utf-8")
+        username, password = decoded.split(":", 1)
+    except Exception:
+        return None
+    with DB_LOCK, db() as connection:
+        row = connection.execute("SELECT * FROM users WHERE username = ?", (username,)).fetchone()
+    if row and verify_password(password, row["password_hash"]):
+        return row_to_user(row)
+    return None
+
+
+def authenticate_bearer(header: str) -> dict | None:
+    token = header.split(" ", 1)[1].strip() if " " in header else ""
+    if not token:
+        return None
+    current_time = now_iso()
+    with DB_LOCK, db() as connection:
+        row = connection.execute(
+            """
+            SELECT users.*
+            FROM api_tokens
+            JOIN users ON users.id = api_tokens.user_id
+            WHERE api_tokens.token_hash = ?
+              AND (api_tokens.expires_at = '' OR api_tokens.expires_at > ?)
+            """,
+            (token_hash(token), current_time),
+        ).fetchone()
+        if row:
+            connection.execute("UPDATE api_tokens SET last_used_at = ? WHERE token_hash = ?", (current_time, token_hash(token)))
+    return row_to_user(row)
+
+
+def authenticate_request(headers) -> dict | None:
+    if AUTH_DISABLED:
+        return {"id": 0, "username": "auth-disabled", "role": "admin", "createdAt": ""}
+    authorization = headers.get("Authorization", "")
+    if authorization.lower().startswith("basic "):
+        return authenticate_basic(authorization)
+    if authorization.lower().startswith("bearer "):
+        return authenticate_bearer(authorization)
+    return None
+
+
+def list_api_tokens(user_id: int) -> list[dict]:
+    with DB_LOCK, db() as connection:
+        rows = connection.execute(
+            "SELECT id, name, last_used_at, expires_at, created_at FROM api_tokens WHERE user_id = ? ORDER BY id DESC",
+            (user_id,),
+        ).fetchall()
+    return [
+        {"id": row["id"], "name": row["name"], "lastUsedAt": row["last_used_at"], "expiresAt": row["expires_at"], "createdAt": row["created_at"]}
+        for row in rows
+    ]
+
+
+def create_api_token(user_id: int, payload: dict) -> dict:
+    raw_token = secrets.token_urlsafe(32)
+    name = str(payload.get("name") or "API Token").strip() or "API Token"
+    created_at = now_iso()
+    with DB_LOCK, db() as connection:
+        cursor = connection.execute(
+            "INSERT INTO api_tokens (user_id, name, token_hash, expires_at, created_at) VALUES (?, ?, ?, ?, ?)",
+            (user_id, name, token_hash(raw_token), str(payload.get("expiresAt") or ""), created_at),
+        )
+    return {"id": cursor.lastrowid, "name": name, "token": raw_token, "createdAt": created_at}
+
+
+def delete_api_token(user_id: int, token_id: int) -> dict:
+    with DB_LOCK, db() as connection:
+        connection.execute("DELETE FROM api_tokens WHERE id = ? AND user_id = ?", (token_id, user_id))
+    return {"ok": True}
 
 
 def row_to_device(row: sqlite3.Row) -> dict:
@@ -236,6 +524,500 @@ def row_to_sample(row: sqlite3.Row) -> dict:
     }
 
 
+def default_threshold_metric(sensor_type: str) -> str:
+    return "maxBps" if sensor_type == "snmp_traffic" else "value_number"
+
+
+def row_to_threshold(row: sqlite3.Row | None, sensor_type: str = "") -> dict:
+    if not row:
+        return {
+            "enabled": False,
+            "metric": default_threshold_metric(sensor_type),
+            "warningOperator": "",
+            "warningValue": None,
+            "criticalOperator": "",
+            "criticalValue": None,
+        }
+    return {
+        "enabled": bool(row["enabled"]),
+        "metric": row["metric"],
+        "warningOperator": row["warning_operator"],
+        "warningValue": row["warning_value"],
+        "criticalOperator": row["critical_operator"],
+        "criticalValue": row["critical_value"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def get_sensor_threshold(sensor_id: int) -> dict:
+    with DB_LOCK, db() as connection:
+        sensor = connection.execute("SELECT type FROM sensors WHERE id = ?", (sensor_id,)).fetchone()
+        if not sensor:
+            raise ValueError("Sensor not found.")
+        row = connection.execute("SELECT * FROM sensor_thresholds WHERE sensor_id = ?", (sensor_id,)).fetchone()
+    return row_to_threshold(row, sensor["type"])
+
+
+def save_sensor_threshold(sensor_id: int, payload: dict) -> dict:
+    allowed_metrics = {"value_number", "inBps", "outBps", "maxBps"}
+    allowed_operators = {"", ">", ">=", "<", "<=", "==", "!="}
+    metric = str(payload.get("metric") or "value_number").strip()
+    warning_operator = str(payload.get("warningOperator") or payload.get("warning_operator") or "").strip()
+    critical_operator = str(payload.get("criticalOperator") or payload.get("critical_operator") or "").strip()
+    if metric not in allowed_metrics:
+        raise ValueError("Unsupported threshold metric.")
+    if warning_operator not in allowed_operators or critical_operator not in allowed_operators:
+        raise ValueError("Unsupported threshold operator.")
+
+    def number_or_none(value):
+        if value in {"", None}:
+            return None
+        return float(value)
+
+    timestamp = now_iso()
+    with DB_LOCK, db() as connection:
+        sensor = connection.execute("SELECT id, type FROM sensors WHERE id = ?", (sensor_id,)).fetchone()
+        if not sensor:
+            raise ValueError("Sensor not found.")
+        connection.execute(
+            """
+            INSERT INTO sensor_thresholds
+              (sensor_id, metric, warning_operator, warning_value, critical_operator, critical_value, enabled, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sensor_id) DO UPDATE SET
+              metric = excluded.metric,
+              warning_operator = excluded.warning_operator,
+              warning_value = excluded.warning_value,
+              critical_operator = excluded.critical_operator,
+              critical_value = excluded.critical_value,
+              enabled = excluded.enabled,
+              updated_at = excluded.updated_at
+            """,
+            (
+                sensor_id,
+                metric,
+                warning_operator,
+                number_or_none(payload.get("warningValue", payload.get("warning_value"))),
+                critical_operator,
+                number_or_none(payload.get("criticalValue", payload.get("critical_value"))),
+                1 if payload.get("enabled") else 0,
+                timestamp,
+            ),
+        )
+        row = connection.execute("SELECT * FROM sensor_thresholds WHERE sensor_id = ?", (sensor_id,)).fetchone()
+    return row_to_threshold(row, sensor["type"])
+
+
+def row_to_threshold_rule(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "sensorId": row["sensor_id"],
+        "enabled": bool(row["enabled"]),
+        "severity": row["severity"],
+        "metric": row["metric"],
+        "direction": row["direction"],
+        "mode": row["mode"],
+        "percent": row["percent"],
+        "absoluteMbps": row["absolute_mbps"],
+        "label": row["label"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def get_sensor_threshold_rules(sensor_id: int) -> dict:
+    with DB_LOCK, db() as connection:
+        sensor = connection.execute("SELECT id, type FROM sensors WHERE id = ?", (sensor_id,)).fetchone()
+        if not sensor:
+            raise ValueError("Sensor not found.")
+        if sensor["type"] != "snmp_traffic":
+            raise ValueError("Threshold rules are only available for port traffic sensors.")
+        rows = connection.execute(
+            "SELECT * FROM sensor_threshold_rules WHERE sensor_id = ? ORDER BY id ASC",
+            (sensor_id,),
+        ).fetchall()
+    return {"rules": [row_to_threshold_rule(row) for row in rows]}
+
+
+def normalize_threshold_rule(sensor_id: int, payload: dict) -> dict:
+    allowed_severities = {"warning", "critical"}
+    allowed_metrics = {"maxBps", "inBps", "outBps"}
+    allowed_directions = {"above", "below"}
+    allowed_modes = {"percent", "absolute_mbps"}
+    severity = str(payload.get("severity") or "warning").strip()
+    metric = str(payload.get("metric") or "maxBps").strip()
+    direction = str(payload.get("direction") or "above").strip()
+    mode = str(payload.get("mode") or "percent").strip()
+    if severity not in allowed_severities:
+        raise ValueError("Threshold rule severity must be warning or critical.")
+    if metric not in allowed_metrics:
+        raise ValueError("Threshold rule metric must be maxBps, inBps, or outBps.")
+    if direction not in allowed_directions:
+        raise ValueError("Threshold rule direction must be above or below.")
+    if mode not in allowed_modes:
+        raise ValueError("Threshold rule mode must be percent or absolute_mbps.")
+
+    percent = payload.get("percent")
+    absolute_mbps = payload.get("absoluteMbps", payload.get("absolute_mbps"))
+    if mode == "percent":
+        if percent in {"", None}:
+            raise ValueError("Percent threshold requires a percent value.")
+        percent = float(percent)
+        if percent < 0 or percent > 100:
+            raise ValueError("Percent threshold must be between 0 and 100.")
+        absolute_mbps = None
+    else:
+        if absolute_mbps in {"", None}:
+            raise ValueError("Advanced Mbps threshold requires an Mbps value.")
+        absolute_mbps = float(absolute_mbps)
+        if absolute_mbps < 0:
+            raise ValueError("Advanced Mbps threshold must be 0 or higher.")
+        percent = None
+
+    return {
+        "sensor_id": sensor_id,
+        "enabled": 1 if payload.get("enabled", True) else 0,
+        "severity": severity,
+        "metric": metric,
+        "direction": direction,
+        "mode": mode,
+        "percent": percent,
+        "absolute_mbps": absolute_mbps,
+        "label": str(payload.get("label") or "").strip(),
+    }
+
+
+def save_sensor_threshold_rules(sensor_id: int, payload: dict) -> dict:
+    rules = payload.get("rules")
+    if not isinstance(rules, list):
+        raise ValueError("Threshold rules payload must include a rules list.")
+    timestamp = now_iso()
+    with DB_LOCK, db() as connection:
+        sensor = connection.execute("SELECT id, type FROM sensors WHERE id = ?", (sensor_id,)).fetchone()
+        if not sensor:
+            raise ValueError("Sensor not found.")
+        if sensor["type"] != "snmp_traffic":
+            raise ValueError("Threshold rules are only available for port traffic sensors.")
+        normalized = [normalize_threshold_rule(sensor_id, item if isinstance(item, dict) else {}) for item in rules]
+        connection.execute("DELETE FROM sensor_threshold_rules WHERE sensor_id = ?", (sensor_id,))
+        for item in normalized:
+            connection.execute(
+                """
+                INSERT INTO sensor_threshold_rules
+                  (sensor_id, enabled, severity, metric, direction, mode, percent, absolute_mbps, label, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    item["sensor_id"],
+                    item["enabled"],
+                    item["severity"],
+                    item["metric"],
+                    item["direction"],
+                    item["mode"],
+                    item["percent"],
+                    item["absolute_mbps"],
+                    item["label"],
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        rows = connection.execute(
+            "SELECT * FROM sensor_threshold_rules WHERE sensor_id = ? ORDER BY id ASC",
+            (sensor_id,),
+        ).fetchall()
+    return {"rules": [row_to_threshold_rule(row) for row in rows]}
+
+
+def threshold_metric_value(metric: str, value_number: float | None, sample_meta: dict) -> float | None:
+    if metric == "value_number":
+        return value_number
+    if metric == "inBps":
+        return sample_meta.get("inBps")
+    if metric == "outBps":
+        return sample_meta.get("outBps")
+    if metric == "maxBps":
+        values = [sample_meta.get("inBps"), sample_meta.get("outBps")]
+        numbers = [float(value) for value in values if value is not None]
+        return max(numbers) if numbers else value_number
+    return None
+
+
+def threshold_metric_label(metric: str) -> str:
+    return {"maxBps": "Max Traffic", "inBps": "Inbound", "outBps": "Outbound", "value_number": "Value"}.get(metric, metric)
+
+
+def threshold_rule_limit(rule: dict, sample_meta: dict) -> float | None:
+    if rule["mode"] == "absolute_mbps":
+        return float(rule["absoluteMbps"] or 0) * 1_000_000
+    interface_speed = sample_meta.get("interfaceSpeed")
+    if not interface_speed:
+        return None
+    return float(interface_speed) * float(rule["percent"] or 0) / 100
+
+
+def threshold_rule_matches(rule: dict, value: float | None, sample_meta: dict) -> tuple[bool, float | None]:
+    if not rule["enabled"] or value is None:
+        return False, None
+    limit = threshold_rule_limit(rule, sample_meta)
+    if limit is None:
+        return False, None
+    if rule["direction"] == "above":
+        return float(value) > limit, limit
+    return float(value) < limit, limit
+
+
+def describe_threshold_rule(rule: dict, limit: float | None) -> str:
+    severity = "Critical" if rule["severity"] == "critical" else "Warning"
+    direction = ">" if rule["direction"] == "above" else "<"
+    metric = threshold_metric_label(rule["metric"])
+    if rule["mode"] == "absolute_mbps":
+        target = f"{rule['absoluteMbps']:.2f} Mbps"
+    else:
+        target = f"{rule['percent']:.2f}% of {format_bps(limit * 100 / max(float(rule['percent'] or 1), 1))}" if limit is not None else f"{rule['percent']:.2f}% of port speed"
+    return f"{severity} threshold breached: {metric} {direction} {target}"
+
+
+def apply_threshold_rules(sensor_id: int, value_number: float | None, sample_meta: dict) -> tuple[str | None, str]:
+    with DB_LOCK, db() as connection:
+        rows = connection.execute(
+            "SELECT * FROM sensor_threshold_rules WHERE sensor_id = ? ORDER BY id ASC",
+            (sensor_id,),
+        ).fetchall()
+    matches = []
+    for row in rows:
+        rule = row_to_threshold_rule(row)
+        metric_value = threshold_metric_value(rule["metric"], value_number, sample_meta)
+        matched, limit = threshold_rule_matches(rule, metric_value, sample_meta)
+        if matched:
+            matches.append((rule, limit))
+    critical = next((item for item in matches if item[0]["severity"] == "critical"), None)
+    if critical:
+        return "down", describe_threshold_rule(critical[0], critical[1])
+    warning = next((item for item in matches if item[0]["severity"] == "warning"), None)
+    if warning:
+        return "warning", describe_threshold_rule(warning[0], warning[1])
+    return None, ""
+
+
+def compare_threshold(value: float | None, operator: str, limit: float | None) -> bool:
+    if value is None or limit is None or not operator:
+        return False
+    value = float(value)
+    limit = float(limit)
+    if operator == ">":
+        return value > limit
+    if operator == ">=":
+        return value >= limit
+    if operator == "<":
+        return value < limit
+    if operator == "<=":
+        return value <= limit
+    if operator == "==":
+        return value == limit
+    if operator == "!=":
+        return value != limit
+    return False
+
+
+def apply_threshold(sensor_id: int, sensor_type: str, status: str, value_number: float | None, sample_meta: dict, error: str) -> tuple[str, str]:
+    if status not in {"up", "warning"}:
+        return status, error
+    if sensor_type == "snmp_traffic":
+        rule_status, rule_error = apply_threshold_rules(sensor_id, value_number, sample_meta)
+        if rule_status:
+            return rule_status, rule_error
+        return status, error
+    with DB_LOCK, db() as connection:
+        row = connection.execute("SELECT * FROM sensor_thresholds WHERE sensor_id = ?", (sensor_id,)).fetchone()
+    threshold = row_to_threshold(row, sensor_type)
+    if not threshold["enabled"]:
+        return status, error
+    metric_value = threshold_metric_value(threshold["metric"], value_number, sample_meta)
+    if compare_threshold(metric_value, threshold["criticalOperator"], threshold["criticalValue"]):
+        return "down", f"Critical threshold breached: {threshold['metric']} {threshold['criticalOperator']} {threshold['criticalValue']}"
+    if compare_threshold(metric_value, threshold["warningOperator"], threshold["warningValue"]):
+        return "warning", f"Warning threshold breached: {threshold['metric']} {threshold['warningOperator']} {threshold['warningValue']}"
+    return status, error
+
+
+def row_to_notification_channel(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "name": row["name"],
+        "type": row["type"],
+        "enabled": bool(row["enabled"]),
+        "config": json.loads(row["config_json"] or "{}"),
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def list_notification_channels() -> list[dict]:
+    with DB_LOCK, db() as connection:
+        rows = connection.execute("SELECT * FROM notification_channels ORDER BY id DESC").fetchall()
+    return [row_to_notification_channel(row) for row in rows]
+
+
+def save_notification_channel(payload: dict, channel_id: int | None = None) -> dict:
+    channel_type = str(payload.get("type") or "").strip()
+    if channel_type not in {"webhook", "email", "slack_webhook", "teams_webhook"}:
+        raise ValueError("Notification channel type must be webhook, email, slack_webhook, or teams_webhook.")
+    name = str(payload.get("name") or channel_type).strip() or channel_type
+    config = payload.get("config") if isinstance(payload.get("config"), dict) else {}
+    timestamp = now_iso()
+    with DB_LOCK, db() as connection:
+        if channel_id is None:
+            cursor = connection.execute(
+                "INSERT INTO notification_channels (name, type, enabled, config_json, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?)",
+                (name, channel_type, 1 if payload.get("enabled", True) else 0, json.dumps(config), timestamp, timestamp),
+            )
+            channel_id = cursor.lastrowid
+        else:
+            connection.execute(
+                "UPDATE notification_channels SET name = ?, type = ?, enabled = ?, config_json = ?, updated_at = ? WHERE id = ?",
+                (name, channel_type, 1 if payload.get("enabled", True) else 0, json.dumps(config), timestamp, channel_id),
+            )
+        row = connection.execute("SELECT * FROM notification_channels WHERE id = ?", (channel_id,)).fetchone()
+    if not row:
+        raise ValueError("Notification channel not found.")
+    return row_to_notification_channel(row)
+
+
+def delete_notification_channel(channel_id: int) -> dict:
+    with DB_LOCK, db() as connection:
+        connection.execute("DELETE FROM notification_channels WHERE id = ?", (channel_id,))
+    return {"ok": True}
+
+
+def list_notification_deliveries(limit: int = 80) -> list[dict]:
+    with DB_LOCK, db() as connection:
+        rows = connection.execute(
+            """
+            SELECT notification_deliveries.*, notification_channels.name AS channel_name, notification_channels.type AS channel_type
+            FROM notification_deliveries
+            LEFT JOIN notification_channels ON notification_channels.id = notification_deliveries.channel_id
+            ORDER BY notification_deliveries.id DESC
+            LIMIT ?
+            """,
+            (min(max(int(limit or 80), 1), 200),),
+        ).fetchall()
+    return [
+        {
+            "id": row["id"],
+            "channelId": row["channel_id"],
+            "channelName": row["channel_name"],
+            "channelType": row["channel_type"],
+            "eventId": row["event_id"],
+            "status": row["status"],
+            "response": row["response"],
+            "statusCode": row["status_code"],
+            "retryCount": row["retry_count"],
+            "createdAt": row["created_at"],
+            "updatedAt": row["updated_at"],
+        }
+        for row in rows
+    ]
+
+
+def notification_payload(event: dict, sensor: dict | None, device: dict | None) -> dict:
+    return {
+        "event": event,
+        "sensor": sensor,
+        "device": device,
+        "summary": event.get("title") or "NetworkManager alert",
+        "message": event.get("message") or "",
+    }
+
+
+def post_json_url(url: str, payload: dict, timeout: float = 5.0) -> tuple[int | None, str]:
+    data = json.dumps(payload).encode("utf-8")
+    req = urlrequest.Request(url, data=data, headers={"Content-Type": "application/json", "User-Agent": "NetworkManager/1.0"}, method="POST")
+    try:
+        with urlrequest.urlopen(req, timeout=timeout) as response:
+            return response.status, response.read(500).decode("utf-8", errors="replace")
+    except urlerror.HTTPError as exc:
+        return exc.code, exc.read(500).decode("utf-8", errors="replace")
+
+
+def deliver_webhook(channel: dict, payload: dict) -> tuple[int | None, str]:
+    url = str(channel["config"].get("url") or "").strip()
+    if not url:
+        raise ValueError("Webhook URL is required.")
+    if channel["type"] == "slack_webhook":
+        body = {"text": f"*{payload['summary']}*\n{payload['message']}"}
+    elif channel["type"] == "teams_webhook":
+        body = {"text": f"{payload['summary']}\n{payload['message']}"}
+    else:
+        body = payload
+    return post_json_url(url, body)
+
+
+def deliver_email(channel: dict, payload: dict) -> tuple[int | None, str]:
+    config = channel["config"]
+    host = str(config.get("host") or "").strip()
+    to_address = str(config.get("to") or "").strip()
+    from_address = str(config.get("from") or config.get("username") or "").strip()
+    if not host or not to_address or not from_address:
+        raise ValueError("Email host, from, and to are required.")
+    port = int(config.get("port") or 587)
+    message = EmailMessage()
+    message["Subject"] = f"NetworkManager: {payload['summary']}"
+    message["From"] = from_address
+    message["To"] = to_address
+    message.set_content(f"{payload['summary']}\n\n{payload['message']}\n\n{json.dumps(payload, indent=2)}")
+    username = str(config.get("username") or "").strip()
+    password = str(config.get("password") or "")
+    use_tls = bool(config.get("useTls", True))
+    context = ssl.create_default_context()
+    with smtplib.SMTP(host, port, timeout=8) as smtp:
+        if use_tls:
+            smtp.starttls(context=context)
+        if username:
+            smtp.login(username, password)
+        smtp.send_message(message)
+    return None, "sent"
+
+
+def record_notification_delivery(channel_id: int, event_id: int, status: str, response: str = "", status_code: int | None = None) -> None:
+    timestamp = now_iso()
+    with DB_LOCK, db() as connection:
+        connection.execute(
+            """
+            INSERT INTO notification_deliveries
+              (channel_id, event_id, status, response, status_code, retry_count, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, 0, ?, ?)
+            """,
+            (channel_id, event_id, status, response[:1000], status_code, timestamp, timestamp),
+        )
+
+
+def deliver_notifications_for_event(event_id: int) -> None:
+    with DB_LOCK, db() as connection:
+        event_row = connection.execute("SELECT * FROM events WHERE id = ?", (event_id,)).fetchone()
+        if not event_row:
+            return
+        sensor_row = connection.execute("SELECT * FROM sensors WHERE id = ?", (event_row["sensor_id"],)).fetchone() if event_row["sensor_id"] else None
+        device_row = connection.execute("SELECT * FROM devices WHERE id = ?", (event_row["device_id"],)).fetchone() if event_row["device_id"] else None
+        channel_rows = connection.execute("SELECT * FROM notification_channels WHERE enabled = 1 ORDER BY id ASC").fetchall()
+    event = row_to_event(event_row)
+    sensor = row_to_sensor(sensor_row) if sensor_row else None
+    device = row_to_device(device_row) if device_row else None
+    payload = notification_payload(event, sensor, device)
+    for channel_row in channel_rows:
+        channel = row_to_notification_channel(channel_row)
+        try:
+            if channel["type"] in {"webhook", "slack_webhook", "teams_webhook"}:
+                status_code, response = deliver_webhook(channel, payload)
+            elif channel["type"] == "email":
+                status_code, response = deliver_email(channel, payload)
+            else:
+                raise ValueError("Unsupported notification channel.")
+            delivery_status = "sent" if status_code is None or 200 <= int(status_code) < 300 else "failed"
+            record_notification_delivery(channel["id"], event_id, delivery_status, response, status_code)
+        except Exception as exc:
+            record_notification_delivery(channel["id"], event_id, "failed", str(exc), None)
+
+
 def clean_snmp_text(value) -> str:
     text = str(value or "").strip()
     if len(text) >= 2 and text[0] == text[-1] and text[0] in {"'", '"'}:
@@ -307,21 +1089,93 @@ def assert_unique_sensor_configs(connection: sqlite3.Connection, device_id: int,
             batch[key] = str(config.get("interfaceName") or config.get("oid") or config.get("index") or "this request").strip()
 
 
-def get_devices() -> list[dict]:
+def query_limit_offset(filters: dict, default_limit: int = 500) -> tuple[int, int]:
+    limit = min(max(1, int(filters.get("limit") or default_limit)), 1000)
+    offset = max(0, int(filters.get("offset") or 0))
+    return limit, offset
+
+
+def get_devices(filters: dict | None = None) -> list[dict]:
+    filters = filters or {}
+    where = []
+    params = []
+    q = str(filters.get("q") or "").strip()
+    status = str(filters.get("status") or "").strip()
+    if q:
+        where.append("(name LIKE ? OR host LIKE ? OR group_name LIKE ? OR tags LIKE ? OR notes LIKE ?)")
+        like = f"%{q}%"
+        params.extend([like, like, like, like, like])
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    limit, offset = query_limit_offset(filters)
+    sql = "SELECT * FROM devices"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY group_name, name LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
     with DB_LOCK, db() as connection:
-        rows = connection.execute("SELECT * FROM devices ORDER BY group_name, name").fetchall()
+        rows = connection.execute(sql, params).fetchall()
         return [row_to_device(row) for row in rows]
 
 
-def get_sensors() -> list[dict]:
+def get_sensors(filters: dict | None = None) -> list[dict]:
+    filters = filters or {}
+    where = []
+    params = []
+    q = str(filters.get("q") or "").strip()
+    status = str(filters.get("status") or "").strip()
+    sensor_type = str(filters.get("type") or "").strip()
+    device_id = str(filters.get("deviceId") or filters.get("device_id") or "").strip()
+    if q:
+        where.append("(sensors.name LIKE ? OR sensors.type LIKE ? OR sensors.last_value LIKE ? OR devices.name LIKE ? OR devices.host LIKE ?)")
+        like = f"%{q}%"
+        params.extend([like, like, like, like, like])
+    if status:
+        where.append("sensors.status = ?")
+        params.append(status)
+    if sensor_type:
+        where.append("sensors.type = ?")
+        params.append(sensor_type)
+    if device_id:
+        where.append("sensors.device_id = ?")
+        params.append(int(device_id))
+    limit, offset = query_limit_offset(filters)
+    sql = "SELECT sensors.* FROM sensors LEFT JOIN devices ON devices.id = sensors.device_id"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY sensors.id DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
     with DB_LOCK, db() as connection:
-        rows = connection.execute("SELECT * FROM sensors ORDER BY id DESC").fetchall()
+        rows = connection.execute(sql, params).fetchall()
         return [row_to_sensor(row) for row in rows]
 
 
-def get_events(limit: int = 80) -> list[dict]:
+def get_events(limit: int = 80, filters: dict | None = None) -> list[dict]:
+    filters = filters or {}
+    where = []
+    params = []
+    status = str(filters.get("status") or "").strip()
+    device_id = str(filters.get("deviceId") or filters.get("device_id") or "").strip()
+    sensor_id = str(filters.get("sensorId") or filters.get("sensor_id") or "").strip()
+    if status:
+        where.append("status = ?")
+        params.append(status)
+    if device_id:
+        where.append("device_id = ?")
+        params.append(int(device_id))
+    if sensor_id:
+        where.append("sensor_id = ?")
+        params.append(int(sensor_id))
+    limit = min(max(1, int(filters.get("limit") or limit or 80)), 500)
+    offset = max(0, int(filters.get("offset") or 0))
+    sql = "SELECT * FROM events"
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    params.extend([limit, offset])
     with DB_LOCK, db() as connection:
-        rows = connection.execute("SELECT * FROM events ORDER BY id DESC LIMIT ?", (limit,)).fetchall()
+        rows = connection.execute(sql, params).fetchall()
         return [row_to_event(row) for row in rows]
 
 
@@ -424,8 +1278,8 @@ def create_sensor(device_id: int, payload: dict) -> dict:
     sensor_type = str(payload.get("type") or "").strip().lower()
     if sensor_type == "ping":
         sensor_type = "icmp"
-    if sensor_type not in {"icmp", "snmp", "snmp_traffic"}:
-        raise ValueError("Sensor type must be icmp, snmp, or snmp_traffic.")
+    if sensor_type not in {"icmp", "snmp", "snmp_traffic", "http"}:
+        raise ValueError("Sensor type must be icmp, snmp, snmp_traffic, or http.")
 
     with DB_LOCK, db() as connection:
         device = connection.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
@@ -456,6 +1310,19 @@ def create_sensor(device_id: int, payload: dict) -> dict:
             "outOid": str(payload.get("outOid") or f"{IF_HC_OUT_OID}.{index}").strip(),
             "community": str(payload.get("community") or device["snmp_community"] or "public").strip(),
             "port": int(payload.get("port") or device["snmp_port"] or 161),
+        }
+    elif sensor_type == "http":
+        default_name = "HTTP Check"
+        url = str(payload.get("url") or f"http://{device['host']}").strip()
+        if not url:
+            raise ValueError("HTTP URL is required.")
+        config = {
+            "url": url,
+            "method": str(payload.get("method") or "GET").upper(),
+            "expectedStatus": int(payload.get("expectedStatus") or 200),
+            "timeout": float(payload.get("timeout") or 5),
+            "keyword": str(payload.get("keyword") or "").strip(),
+            "verifyTls": bool(payload.get("verifyTls", True)),
         }
 
     created_at = now_iso()
@@ -664,6 +1531,45 @@ def update_device_topology(device_id: int, payload: dict) -> dict:
         return row_to_device(updated)
 
 
+def update_device(device_id: int, payload: dict) -> dict:
+    updated_at = now_iso()
+    with DB_LOCK, db() as connection:
+        row = connection.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+        if not row:
+            raise ValueError("Device not found.")
+        name = str(payload.get("name", row["name"]) or "").strip()
+        host = str(payload.get("host", row["host"]) or "").strip()
+        group_name = str(payload.get("group", row["group_name"]) or "Unassigned").strip() or "Unassigned"
+        if not name or not host:
+            raise ValueError("Device name and host are required.")
+        connection.execute(
+            "INSERT OR IGNORE INTO groups (name, created_at, updated_at) VALUES (?, ?, ?)",
+            (group_name, updated_at, updated_at),
+        )
+        connection.execute(
+            """
+            UPDATE devices
+            SET name = ?, host = ?, group_name = ?, tags = ?, notes = ?,
+                snmp_enabled = ?, snmp_community = ?, snmp_port = ?, updated_at = ?
+            WHERE id = ?
+            """,
+            (
+                name,
+                host,
+                group_name,
+                str(payload.get("tags", row["tags"]) or "").strip(),
+                str(payload.get("notes", row["notes"]) or "").strip(),
+                1 if payload.get("snmpEnabled", bool(row["snmp_enabled"])) else 0,
+                str(payload.get("snmpCommunity", row["snmp_community"]) or "").strip(),
+                int(payload.get("snmpPort", row["snmp_port"]) or 161),
+                updated_at,
+                device_id,
+            ),
+        )
+        updated = connection.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+        return row_to_device(updated)
+
+
 def update_device_group(device_id: int, payload: dict) -> dict:
     group_name = str(payload.get("group") or "Unassigned").strip() or "Unassigned"
     updated_at = now_iso()
@@ -681,6 +1587,48 @@ def update_device_group(device_id: int, payload: dict) -> dict:
         )
         updated = connection.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
         return row_to_device(updated)
+
+
+def update_sensor(sensor_id: int, payload: dict) -> dict:
+    updated_at = now_iso()
+    with DB_LOCK, db() as connection:
+        row = connection.execute("SELECT * FROM sensors WHERE id = ?", (sensor_id,)).fetchone()
+        if not row:
+            raise ValueError("Sensor not found.")
+        config = json.loads(row["config_json"] or "{}")
+        sensor_type = row["type"]
+        if sensor_type == "snmp":
+            if "oid" in payload:
+                config["oid"] = str(payload.get("oid") or "").strip()
+                if not config["oid"]:
+                    raise ValueError("SNMP OID is required.")
+            for source, target in (("unit", "unit"), ("community", "community"), ("port", "port")):
+                if source in payload:
+                    config[target] = int(payload[source]) if source == "port" else str(payload[source] or "").strip()
+        elif sensor_type == "snmp_traffic":
+            for source, target in (("interfaceName", "interfaceName"), ("interfaceDescription", "interfaceDescription"), ("interfaceSpeed", "interfaceSpeed")):
+                if source in payload:
+                    config[target] = int(payload[source]) if source == "interfaceSpeed" else str(payload[source] or "").strip()
+        elif sensor_type == "http":
+            for source in ("url", "method", "keyword"):
+                if source in payload:
+                    config[source] = str(payload[source] or "").strip()
+            for source in ("expectedStatus",):
+                if source in payload:
+                    config[source] = int(payload[source])
+            for source in ("timeout",):
+                if source in payload:
+                    config[source] = float(payload[source])
+            if "verifyTls" in payload:
+                config["verifyTls"] = bool(payload["verifyTls"])
+        name = str(payload.get("name", row["name"]) or "").strip() or row["name"]
+        interval = max(10, int(payload.get("interval", row["interval_seconds"]) or row["interval_seconds"]))
+        connection.execute(
+            "UPDATE sensors SET name = ?, interval_seconds = ?, config_json = ?, updated_at = ? WHERE id = ?",
+            (name, interval, json.dumps(config), updated_at, sensor_id),
+        )
+        updated = connection.execute("SELECT * FROM sensors WHERE id = ?", (sensor_id,)).fetchone()
+    return row_to_sensor(updated)
 
 
 def delete_device(device_id: int) -> dict:
@@ -762,6 +1710,35 @@ def run_snmp_check(host: str, community: str, port: int, oid: str, unit: str = "
     if unit and value_text not in {"", "None"}:
         value_text = f"{value_text} {unit}"
     return "up", value_text, numeric, ""
+
+
+def run_http_check(config: dict) -> tuple[str, str, float | None, str]:
+    url = str(config.get("url") or "").strip()
+    method = str(config.get("method") or "GET").upper()
+    expected_status = int(config.get("expectedStatus") or 200)
+    timeout = float(config.get("timeout") or 5)
+    keyword = str(config.get("keyword") or "")
+    verify_tls = bool(config.get("verifyTls", True))
+    if not url:
+        return "down", "Missing URL", None, "HTTP URL is required."
+    started = time.time()
+    try:
+        req = urlrequest.Request(url, method=method, headers={"User-Agent": "NetworkManager/1.0"})
+        context = ssl._create_unverified_context() if url.lower().startswith("https://") and not verify_tls else None
+        with urlrequest.urlopen(req, timeout=timeout, context=context) as response:
+            body = response.read(8192).decode("utf-8", errors="replace")
+            elapsed_ms = round((time.time() - started) * 1000, 2)
+            if response.status != expected_status:
+                return "down", f"HTTP {response.status} in {elapsed_ms:.0f} ms", elapsed_ms, f"Expected HTTP {expected_status}."
+            if keyword and keyword not in body:
+                return "down", f"HTTP {response.status} keyword missing", elapsed_ms, "Expected keyword was not found."
+            return "up", f"HTTP {response.status} in {elapsed_ms:.0f} ms", elapsed_ms, ""
+    except urlerror.HTTPError as exc:
+        elapsed_ms = round((time.time() - started) * 1000, 2)
+        status = "up" if exc.code == expected_status and not keyword else "down"
+        return status, f"HTTP {exc.code} in {elapsed_ms:.0f} ms", elapsed_ms, "" if status == "up" else str(exc)
+    except Exception as exc:
+        return "down", "HTTP error", None, str(exc)
 
 
 def format_bps(value: float) -> str:
@@ -847,6 +1824,190 @@ def run_snmp_traffic_check(
     return "up", value_text, max(in_bps, out_bps), "", next_config, meta
 
 
+def record_sensor_result(
+    connection: sqlite3.Connection,
+    row: sqlite3.Row,
+    status: str,
+    value_text: str,
+    value_number: float | None,
+    error: str,
+    next_config: dict,
+    sample_meta: dict,
+    checked_at: str,
+) -> int | None:
+    previous = row["status"]
+    connection.execute(
+        """
+        UPDATE sensors
+        SET status = ?, last_value = ?, last_check = ?, last_error = ?, next_check_at = ?, updated_at = ?, config_json = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            value_text,
+            checked_at,
+            error,
+            time.time() + int(row["interval_seconds"]),
+            checked_at,
+            json.dumps(next_config),
+            row["id"],
+        ),
+    )
+    connection.execute(
+        "INSERT INTO samples (sensor_id, status, value_text, value_number, created_at, meta_json) VALUES (?, ?, ?, ?, ?, ?)",
+        (row["id"], status, value_text, value_number, checked_at, json.dumps(sample_meta)),
+    )
+    if previous == status:
+        return None
+    cursor = connection.execute(
+        """
+        INSERT INTO events (device_id, sensor_id, status, title, message, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (
+            row["device_id"],
+            row["id"],
+            status,
+            f"{row['name']} is {statusLabels(status)}",
+            error or value_text,
+            checked_at,
+        ),
+    )
+    return cursor.lastrowid
+
+
+def acquire_traffic_poll(device_id: int) -> bool:
+    with TRAFFIC_POLL_LOCK:
+        if device_id in TRAFFIC_POLL_DEVICES:
+            return False
+        TRAFFIC_POLL_DEVICES.add(device_id)
+        return True
+
+
+def release_traffic_poll(device_id: int) -> None:
+    with TRAFFIC_POLL_LOCK:
+        TRAFFIC_POLL_DEVICES.discard(device_id)
+
+
+def traffic_sensor_result_from_counters(row: sqlite3.Row, in_counter: int | None, out_counter: int | None) -> tuple[str, str, float | None, str, dict, dict]:
+    config = json.loads(row["config_json"] or "{}")
+    index = str(config.get("index") or "").strip()
+    if not index:
+        return "down", "Interface index missing", None, "Traffic interface index missing", config, {}
+    if in_counter is None or out_counter is None:
+        return "down", "Traffic counters missing", None, f"SNMP counters missing for interface index {index}.", config, {}
+
+    checked_at = time.time()
+    previous_in = config.get("lastInCounter")
+    previous_out = config.get("lastOutCounter")
+    previous_at = config.get("lastCounterAt")
+    interface_speed = parse_snmp_int(config.get("interfaceSpeed"))
+    next_config = {
+        **config,
+        "lastInCounter": int(in_counter),
+        "lastOutCounter": int(out_counter),
+        "lastCounterAt": checked_at,
+    }
+    if interface_speed:
+        next_config["interfaceSpeed"] = interface_speed
+
+    if previous_in is None or previous_out is None or previous_at is None:
+        meta = {"inBps": 0, "outBps": 0, "inCounter": int(in_counter), "outCounter": int(out_counter), "interfaceSpeed": interface_speed}
+        return "up", "Baseline captured", 0, "", next_config, meta
+
+    elapsed = max(1.0, checked_at - float(previous_at))
+    in_bps = (counter_delta(int(previous_in), int(in_counter)) * 8) / elapsed
+    out_bps = (counter_delta(int(previous_out), int(out_counter)) * 8) / elapsed
+    value_text = f"In {format_bps(in_bps)} / Out {format_bps(out_bps)}"
+    meta = {
+        "inBps": round(in_bps, 2),
+        "outBps": round(out_bps, 2),
+        "inCounter": int(in_counter),
+        "outCounter": int(out_counter),
+        "interfaceSpeed": interface_speed,
+        "elapsed": round(elapsed, 2),
+    }
+    return "up", value_text, max(in_bps, out_bps), "", next_config, meta
+
+
+def mark_traffic_sensors_failed(device_id: int, rows: list[sqlite3.Row], message: str) -> list[int]:
+    checked_at = now_iso()
+    event_ids = []
+    with DB_LOCK, db() as connection:
+        for row in rows:
+            config = json.loads(row["config_json"] or "{}")
+            event_id = record_sensor_result(connection, row, "down", "SNMP walk failed", None, message, config, {}, checked_at)
+            if event_id:
+                event_ids.append(event_id)
+        update_device_status(connection, device_id)
+    return event_ids
+
+
+def check_device_traffic_sensors(device_id: int, sensor_ids: list[int] | None = None, include_due: bool = False) -> list[dict]:
+    if not acquire_traffic_poll(device_id):
+        return [get_sensor(sensor_id) for sensor_id in (sensor_ids or [])]
+    event_ids = []
+    try:
+        with DB_LOCK, db() as connection:
+            device = connection.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+            if not device:
+                raise ValueError("Device not found.")
+            params: list[object] = [device_id]
+            sql = "SELECT * FROM sensors WHERE device_id = ? AND type = 'snmp_traffic'"
+            if sensor_ids and include_due:
+                placeholders = ",".join("?" for _ in sensor_ids)
+                sql += f" AND (id IN ({placeholders}) OR next_check_at <= ?)"
+                params.extend(sensor_ids)
+                params.append(time.time())
+            elif sensor_ids:
+                placeholders = ",".join("?" for _ in sensor_ids)
+                sql += f" AND id IN ({placeholders})"
+                params.extend(sensor_ids)
+            else:
+                sql += " AND next_check_at <= ?"
+                params.append(time.time())
+            sql += " ORDER BY id ASC"
+            rows = connection.execute(sql, params).fetchall()
+        if not rows:
+            return []
+
+        community = str(device["snmp_community"] or "public").strip()
+        port = int(device["snmp_port"] or 161)
+        try:
+            in_counters = snmp_walk_table(device["host"], community, port, IF_HC_IN_OID, SNMP_TABLE_WALK_LIMIT)
+            out_counters = snmp_walk_table(device["host"], community, port, IF_HC_OUT_OID, SNMP_TABLE_WALK_LIMIT)
+        except Exception as exc:
+            event_ids = mark_traffic_sensors_failed(device_id, rows, f"SNMP walk failure: {exc}")
+            return [get_sensor(row["id"]) for row in rows]
+
+        results = []
+        for row in rows:
+            config = json.loads(row["config_json"] or "{}")
+            index = str(config.get("index") or "").strip()
+            status, value_text, value_number, error, next_config, sample_meta = traffic_sensor_result_from_counters(
+                row,
+                in_counters.get(index),
+                out_counters.get(index),
+            )
+            status, threshold_error = apply_threshold(row["id"], row["type"], status, value_number, sample_meta, error)
+            if threshold_error:
+                error = threshold_error
+            results.append((row, status, value_text, value_number, error, next_config, sample_meta))
+
+        checked_at = now_iso()
+        with DB_LOCK, db() as connection:
+            for row, status, value_text, value_number, error, next_config, sample_meta in results:
+                event_id = record_sensor_result(connection, row, status, value_text, value_number, error, next_config, sample_meta, checked_at)
+                if event_id:
+                    event_ids.append(event_id)
+            update_device_status(connection, device_id)
+        return [get_sensor(row["id"]) for row in rows]
+    finally:
+        release_traffic_poll(device_id)
+        for event_id in event_ids:
+            threading.Thread(target=deliver_notifications_for_event, args=(event_id,), daemon=True).start()
+
+
 def check_sensor(sensor_id: int) -> dict:
     with DB_LOCK, db() as connection:
         row = connection.execute(
@@ -861,6 +2022,17 @@ def check_sensor(sensor_id: int) -> dict:
 
     if not row:
         raise ValueError("Sensor not found.")
+
+    if row["type"] == "snmp_traffic":
+        if row["last_check"]:
+            try:
+                last_check = datetime.fromisoformat(row["last_check"])
+                if (datetime.now(timezone.utc).astimezone() - last_check).total_seconds() < 2:
+                    return get_sensor(sensor_id)
+            except Exception:
+                pass
+        checked = check_device_traffic_sensors(row["device_id"], [sensor_id], include_due=True)
+        return checked[0] if checked else get_sensor(sensor_id)
 
     config = json.loads(row["config_json"] or "{}")
     if row["type"] == "icmp":
@@ -884,12 +2056,20 @@ def check_sensor(sensor_id: int) -> dict:
             int(config.get("port") or row["snmp_port"] or 161),
             config,
         )
+    elif row["type"] == "http":
+        status, value_text, value_number, error = run_http_check(config)
+        next_config = config
+        sample_meta = {}
     else:
         status, value_text, value_number, error = "unknown", "Unsupported sensor", None, "Unsupported sensor type"
         next_config = config
         sample_meta = {}
 
+    status, threshold_error = apply_threshold(row["id"], row["type"], status, value_number, sample_meta, error)
+    if threshold_error:
+        error = threshold_error
     checked_at = now_iso()
+    event_id = None
     with DB_LOCK, db() as connection:
         previous = connection.execute("SELECT status FROM sensors WHERE id = ?", (sensor_id,)).fetchone()["status"]
         connection.execute(
@@ -914,7 +2094,7 @@ def check_sensor(sensor_id: int) -> dict:
             (sensor_id, status, value_text, value_number, checked_at, json.dumps(sample_meta)),
         )
         if previous != status:
-            connection.execute(
+            cursor = connection.execute(
                 """
                 INSERT INTO events (device_id, sensor_id, status, title, message, created_at)
                 VALUES (?, ?, ?, ?, ?, ?)
@@ -928,13 +2108,17 @@ def check_sensor(sensor_id: int) -> dict:
                     checked_at,
                 ),
             )
+            event_id = cursor.lastrowid
         update_device_status(connection, row["device_id"])
+
+    if event_id:
+        threading.Thread(target=deliver_notifications_for_event, args=(event_id,), daemon=True).start()
 
     return get_sensor(sensor_id)
 
 
 def statusLabels(status: str) -> str:
-    return {"up": "Up", "warning": "Warning", "down": "Down", "unknown": "Unknown"}.get(status, status)
+    return {"up": "Up", "warning": "Warning", "down": "Critical", "unknown": "Unknown"}.get(status, status)
 
 
 def update_device_status(connection: sqlite3.Connection, device_id: int) -> None:
@@ -957,12 +2141,33 @@ def scheduler() -> None:
     while True:
         try:
             with DB_LOCK, db() as connection:
-                rows = connection.execute(
-                    "SELECT id FROM sensors WHERE next_check_at <= ? ORDER BY next_check_at ASC LIMIT 8",
+                non_traffic_rows = connection.execute(
+                    """
+                    SELECT id FROM sensors
+                    WHERE next_check_at <= ? AND type != 'snmp_traffic'
+                    ORDER BY next_check_at ASC
+                    LIMIT ?
+                    """,
+                    (time.time(), SENSOR_BATCH_LIMIT),
+                ).fetchall()
+                traffic_rows = connection.execute(
+                    """
+                    SELECT id, device_id FROM sensors
+                    WHERE next_check_at <= ? AND type = 'snmp_traffic'
+                    ORDER BY next_check_at ASC
+                    """,
                     (time.time(),),
                 ).fetchall()
-            for row in rows:
+            for row in non_traffic_rows:
                 check_sensor(row["id"])
+            grouped: dict[int, list[int]] = {}
+            for row in traffic_rows:
+                device_id = int(row["device_id"])
+                if device_id not in grouped and len(grouped) >= TRAFFIC_DEVICE_BATCH_LIMIT:
+                    continue
+                grouped.setdefault(device_id, []).append(int(row["id"]))
+            for device_id, sensor_ids in grouped.items():
+                check_device_traffic_sensors(device_id, sensor_ids)
         except Exception:
             pass
         time.sleep(3)
@@ -1151,7 +2356,7 @@ def snmp_walk(host: str, community: str, port: int, base_oid: str, limit: int = 
     oid_parts(base_oid)
     current_oid = base_oid
     items = []
-    limit = min(max(1, int(limit or SNMP_WALK_LIMIT)), SNMP_WALK_LIMIT)
+    limit = min(max(1, int(limit or SNMP_WALK_LIMIT)), SNMP_TABLE_WALK_LIMIT)
 
     for _ in range(limit):
         next_oid, value = snmp_get_next(host, community, port, current_oid)
@@ -1168,6 +2373,17 @@ def snmp_walk(host: str, community: str, port: int, base_oid: str, limit: int = 
         )
         current_oid = next_oid
     return items
+
+
+def snmp_walk_table(host: str, community: str, port: int, base_oid: str, limit: int = SNMP_TABLE_WALK_LIMIT) -> dict[str, int]:
+    rows = snmp_walk(host, community, port, base_oid, limit)
+    table = {}
+    for item in rows:
+        index = str(item.get("index") or "").strip()
+        if not index:
+            continue
+        table[index] = parse_snmp_int(item.get("value"))
+    return table
 
 
 def discover_snmp_walk(device_id: int, payload: dict) -> dict:
@@ -1229,29 +2445,73 @@ def discover_interface_traffic(device_id: int, payload: dict) -> dict:
 
 class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
-        super().__init__(*args, directory=str(ROOT), **kwargs)
+        super().__init__(*args, directory=str(static_root()), **kwargs)
+
+    def public_api_path(self, path: str) -> bool:
+        return path in {"/api/auth/login", "/api/auth/logout", "/api/auth/setup", "/api/auth/me"}
+
+    def require_api_auth(self, path: str) -> bool:
+        if not path.startswith("/api/") or self.public_api_path(path):
+            self.current_user = authenticate_request(self.headers)
+            return True
+        user = authenticate_request(self.headers)
+        if user:
+            self.current_user = user
+            return True
+        return False
+
+    def auth_token_from_header(self) -> str:
+        authorization = self.headers.get("Authorization", "")
+        if authorization.lower().startswith("bearer "):
+            return authorization.split(" ", 1)[1].strip()
+        return ""
+
+    def send_auth_required(self) -> None:
+        self.send_response(401)
+        self.send_header("Content-Type", "application/json; charset=utf-8")
+        payload = json.dumps({"error": "Authentication required.", "setupRequired": auth_setup_required()}).encode("utf-8")
+        self.send_header("Content-Length", str(len(payload)))
+        self.end_headers()
+        self.wfile.write(payload)
 
     def do_GET(self) -> None:
         parsed_url = urlparse(self.path)
         path = parsed_url.path
+        if not self.require_api_auth(path):
+            return self.send_auth_required()
+        query = {key: values[-1] for key, values in parse_qs(parsed_url.query).items()}
         try:
+            if path == "/api/auth/me":
+                user = getattr(self, "current_user", None)
+                return self.send_json({"authenticated": bool(user), "user": user, "setupRequired": auth_setup_required(), "authDisabled": AUTH_DISABLED})
             if path == "/api/summary":
                 return self.send_json(get_summary())
             if path == "/api/devices":
-                return self.send_json(get_devices())
+                return self.send_json(get_devices(query))
             if path == "/api/groups":
                 return self.send_json(get_groups())
             if path == "/api/sensors":
-                return self.send_json(get_sensors())
+                return self.send_json(get_sensors(query))
             if path == "/api/events":
-                return self.send_json(get_events())
+                return self.send_json(get_events(filters=query))
+            if path == "/api/tokens":
+                return self.send_json(list_api_tokens(int(self.current_user["id"])))
+            if path == "/api/notification-channels":
+                return self.send_json(list_notification_channels())
+            if path == "/api/notification-deliveries":
+                return self.send_json(list_notification_deliveries(int(query.get("limit") or 80)))
             match = re.fullmatch(r"/api/sensors/(\d+)/samples", path)
             if match:
                 return self.send_json(get_sensor_samples(int(match.group(1))))
+            match = re.fullmatch(r"/api/sensors/(\d+)/thresholds", path)
+            if match:
+                return self.send_json(get_sensor_threshold(int(match.group(1))))
+            match = re.fullmatch(r"/api/sensors/(\d+)/threshold-rules", path)
+            if match:
+                return self.send_json(get_sensor_threshold_rules(int(match.group(1))))
             match = re.fullmatch(r"/api/devices/(\d+)/traffic-samples", path)
             if match:
-                query = parse_qs(parsed_url.query)
-                limit = int(query.get("limit", [24])[0] or 24)
+                limit = int(query.get("limit") or 24)
                 return self.send_json(get_device_traffic_samples(int(match.group(1)), limit))
             if path == "/api/snmp/templates":
                 return self.send_json(
@@ -1266,8 +2526,20 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_POST(self) -> None:
         path = urlparse(self.path).path
+        if not self.require_api_auth(path):
+            return self.send_auth_required()
         try:
             payload = self.read_json()
+            if path == "/api/auth/setup":
+                return self.send_json(create_initial_admin(payload), 201)
+            if path == "/api/auth/login":
+                return self.send_json(login_user(payload))
+            if path == "/api/auth/logout":
+                return self.send_json(logout_token(self.auth_token_from_header()))
+            if path == "/api/tokens":
+                return self.send_json(create_api_token(int(self.current_user["id"]), payload), 201)
+            if path == "/api/notification-channels":
+                return self.send_json(save_notification_channel(payload), 201)
             if path == "/api/devices":
                 return self.send_json(create_device(payload), 201)
             if path == "/api/groups":
@@ -1310,9 +2582,56 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_error_json(str(exc), 500)
         return self.send_error_json("Not found", 404)
 
+    def do_PATCH(self) -> None:
+        path = urlparse(self.path).path
+        if not self.require_api_auth(path):
+            return self.send_auth_required()
+        try:
+            payload = self.read_json()
+            match = re.fullmatch(r"/api/devices/(\d+)", path)
+            if match:
+                return self.send_json(update_device(int(match.group(1)), payload))
+            match = re.fullmatch(r"/api/sensors/(\d+)", path)
+            if match:
+                return self.send_json(update_sensor(int(match.group(1)), payload))
+            match = re.fullmatch(r"/api/notification-channels/(\d+)", path)
+            if match:
+                return self.send_json(save_notification_channel(payload, int(match.group(1))))
+        except ValueError as exc:
+            return self.send_error_json(str(exc), 400)
+        except Exception as exc:
+            return self.send_error_json(str(exc), 500)
+        return self.send_error_json("Not found", 404)
+
+    def do_PUT(self) -> None:
+        path = urlparse(self.path).path
+        if not self.require_api_auth(path):
+            return self.send_auth_required()
+        try:
+            payload = self.read_json()
+            match = re.fullmatch(r"/api/sensors/(\d+)/thresholds", path)
+            if match:
+                return self.send_json(save_sensor_threshold(int(match.group(1)), payload))
+            match = re.fullmatch(r"/api/sensors/(\d+)/threshold-rules", path)
+            if match:
+                return self.send_json(save_sensor_threshold_rules(int(match.group(1)), payload))
+        except ValueError as exc:
+            return self.send_error_json(str(exc), 400)
+        except Exception as exc:
+            return self.send_error_json(str(exc), 500)
+        return self.send_error_json("Not found", 404)
+
     def do_DELETE(self) -> None:
         path = urlparse(self.path).path
+        if not self.require_api_auth(path):
+            return self.send_auth_required()
         try:
+            match = re.fullmatch(r"/api/tokens/(\d+)", path)
+            if match:
+                return self.send_json(delete_api_token(int(self.current_user["id"]), int(match.group(1))))
+            match = re.fullmatch(r"/api/notification-channels/(\d+)", path)
+            if match:
+                return self.send_json(delete_notification_channel(int(match.group(1))))
             match = re.fullmatch(r"/api/sensors/(\d+)", path)
             if match:
                 return self.send_json(delete_sensor(int(match.group(1))))
