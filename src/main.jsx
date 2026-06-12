@@ -1,8 +1,10 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import "../styles.css";
+import { apiRequest, authTokenStorageKey, emptySummary, normalizeList, normalizeSummary } from "./api.js";
+import { parseRouteHash, routeHash } from "./routing.js";
+import { InternetMonitorModal, InternetView, internetDeviceGroup, internetDeviceHost, internetDeviceName } from "./features/internet.jsx";
 
-const emptySummary = { devices: 0, sensors: 0, up: 0, warning: 0, down: 0, unknown: 0 };
 const statusLabels = { up: "Up", warning: "Warning", down: "Critical", unknown: "Unknown", paused: "Paused" };
 const statusRank = ["down", "warning", "unknown", "paused", "up"];
 const deviceSerialNumberOid = "1.3.6.1.2.1.47.1.1.1.1.11";
@@ -10,8 +12,12 @@ const chartPlot = { left: 82, right: 744, top: 36, bottom: 268 };
 chartPlot.width = chartPlot.right - chartPlot.left;
 chartPlot.height = chartPlot.bottom - chartPlot.top;
 const chartTimeStepMs = 30 * 1000;
-const chartVisibleWindowMs = 10 * 60 * 1000;
-const authTokenStorageKey = "networkManagerAuthToken";
+const sampleRangeOptions = [
+  ["1h", "1H"],
+  ["24h", "1D"],
+  ["7d", "7D"],
+  ["30d", "30D"],
+];
 
 const snmpOidGuide = [
   { name: "System Description", oid: "1.3.6.1.2.1.1.1.0", unit: "", description: "Device model, OS, firmware, or system text." },
@@ -21,63 +27,17 @@ const snmpOidGuide = [
   { name: "Interface Description", oid: "1.3.6.1.2.1.2.2.1.2.{ifIndex}", unit: "", description: "Port/interface label. Replace {ifIndex}, for example .2.1.2.1." },
 ];
 
-function authHeaders() {
-  const token = window.localStorage.getItem(authTokenStorageKey);
-  return token ? { Authorization: `Bearer ${token}` } : {};
-}
-
-async function apiRequest(path, options = {}) {
-  const response = await fetch(path, {
-    method: options.method || "GET",
-    headers: { Accept: "application/json", "Content-Type": "application/json", ...authHeaders(), ...(options.headers || {}) },
-    body: options.body ? JSON.stringify(options.body) : undefined,
-  });
-  const payload = await response.json().catch(() => ({}));
-  if (response.status === 401) {
-    const error = new Error(payload.error || "Authentication required.");
-    error.status = 401;
-    error.payload = payload;
-    throw error;
-  }
-  if (!response.ok) throw new Error(payload.error || `${response.status} ${response.statusText}`);
-  return payload;
-}
-
-function normalizeList(value) {
-  if (Array.isArray(value)) return value;
-  if (Array.isArray(value?.items)) return value.items;
-  if (Array.isArray(value?.data)) return value.data;
-  return [];
-}
-
-function normalizeSummary(value) {
-  return { ...emptySummary, ...(value || {}) };
-}
-
-function parseRouteHash(hash = window.location.hash) {
-  const parts = hash.replace(/^#\/?/, "").split("/");
-  if (parts[0] === "device" && parts[1]) return { view: "device-detail", deviceId: parts[1], sensorId: null };
-  if (parts[0] === "sensor" && parts[1]) return { view: "sensor-detail", deviceId: null, sensorId: parts[1] };
-  if (["devices", "sensors", "events"].includes(parts[0])) return { view: parts[0], deviceId: null, sensorId: null };
-  return { view: "dashboard", deviceId: null, sensorId: null };
-}
-
-function routeHash(route) {
-  if (route.view === "device-detail" && route.deviceId) return `#/device/${route.deviceId}`;
-  if (route.view === "sensor-detail" && route.sensorId) return `#/sensor/${route.sensorId}`;
-  if (["devices", "sensors", "events"].includes(route.view)) return `#/${route.view}`;
-  return "#/dashboard";
-}
-
 function icon(name) {
   const icons = {
     dashboard: '<svg viewBox="0 0 24 24"><path d="M3 4h8v8H3V4Zm10 0h8v5h-8V4ZM3 14h8v6H3v-6Zm10-3h8v9h-8v-9Z"/></svg>',
+    internet: '<svg viewBox="0 0 24 24"><path d="M12 2a10 10 0 1 0 0 20 10 10 0 0 0 0-20Zm6.9 9h-3.1a15.6 15.6 0 0 0-1-5A8.03 8.03 0 0 1 18.9 11ZM12 4.1c.7 1 1.5 3.2 1.8 6.9h-3.6C10.5 7.3 11.3 5.1 12 4.1ZM4.1 13h3.1c.1 1.8.5 3.5 1 5A8.03 8.03 0 0 1 4.1 13Zm3.1-2H4.1A8.03 8.03 0 0 1 8.2 6a15.6 15.6 0 0 0-1 5ZM12 19.9c-.7-1-1.5-3.2-1.8-6.9h3.6c-.3 3.7-1.1 5.9-1.8 6.9ZM14.8 18c.5-1.5.9-3.2 1-5h3.1a8.03 8.03 0 0 1-4.1 5Z"/></svg>',
     server: '<svg viewBox="0 0 24 24"><path d="M4 3h16v8H4V3Zm2 2v4h12V5H6Zm-2 8h16v8H4v-8Zm2 2v4h12v-4H6Zm1-9h2v2H7V6Zm0 10h2v2H7v-2Z"/></svg>',
     sensor: '<svg viewBox="0 0 24 24"><path d="M12 2a4 4 0 0 1 4 4v5.2a6 6 0 1 1-8 0V6a4 4 0 0 1 4-4Zm-2 12-.4.3A4 4 0 1 0 14.4 14l-.4-.3V6a2 2 0 1 0-4 0v8Z"/></svg>',
     alert: '<svg viewBox="0 0 24 24"><path d="M12 2 2 20h20L12 2Zm0 4 6.6 12H5.4L12 6Zm-1 4h2v5h-2v-5Zm0 6h2v2h-2v-2Z"/></svg>',
     plus: '<svg viewBox="0 0 24 24"><path d="M11 4h2v7h7v2h-7v7h-2v-7H4v-2h7V4Z"/></svg>',
     refresh: '<svg viewBox="0 0 24 24"><path d="M17.7 6.3A8 8 0 1 0 20 12h-2a6 6 0 1 1-1.8-4.3L13 11h8V3l-3.3 3.3Z"/></svg>',
     play: '<svg viewBox="0 0 24 24"><path d="M8 5v14l11-7L8 5Z"/></svg>',
+    edit: '<svg viewBox="0 0 24 24"><path d="M16.8 3.2 20.8 7.2 8.5 19.5 4 20l.5-4.5L16.8 3.2Zm0 2.8L6.4 16.4l-.2 1.4 1.4-.2L18 7.2 16.8 6Z"/></svg>',
     trash: '<svg viewBox="0 0 24 24"><path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-3 6h12l-1 12H7L6 9Zm3 2v8h2v-8H9Zm4 0v8h2v-8h-2Z"/></svg>',
     close: '<svg viewBox="0 0 24 24"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12 19 17.6 17.6 19 12 13.4 6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>',
     radar: '<svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9h-2a7 7 0 1 1-7-7V3Zm1 1v9h7v-2h-4.2l4.8-4.8-1.4-1.4-4.8 4.8V4h-1.4Z"/></svg>',
@@ -93,6 +53,7 @@ function App() {
   const [deviceDetailTabs, setDeviceDetailTabs] = useState({});
   const [portSamples, setPortSamples] = useState({});
   const [sensorSamples, setSensorSamples] = useState({});
+  const [sensorSampleRanges, setSensorSampleRanges] = useState({});
   const [sensorSamplesLoading, setSensorSamplesLoading] = useState({});
   const [sensorThresholds, setSensorThresholds] = useState({});
   const [sensorThresholdsLoading, setSensorThresholdsLoading] = useState({});
@@ -164,16 +125,20 @@ function App() {
   }, []);
 
   useEffect(() => {
-    if (!["dashboard", "events"].includes(route.view)) return undefined;
+    if (!["dashboard", "internet", "events"].includes(route.view)) return undefined;
     const timer = window.setInterval(() => loadData({ showLoading: false }), 10000);
     return () => window.clearInterval(timer);
   }, [route.view, loadData]);
 
   const selectedDevice = data.devices.find((device) => String(device.id) === String(route.deviceId));
   const selectedSensor = data.sensors.find((sensor) => String(sensor.id) === String(route.sensorId));
+  const selectedSensorRange = sensorSampleRanges[String(route.sensorId || "")] || "1h";
   const selectedDeviceSensors = selectedDevice ? data.sensors.filter((sensor) => String(sensor.deviceId) === String(selectedDevice.id)) : [];
   const selectedPortSensors = selectedDeviceSensors.filter((sensor) => sensor.type === "snmp_traffic");
   const activeDeviceTab = deviceDetailTabs[String(selectedDevice?.id || "")] || (selectedPortSensors.length ? "ports" : "sensors");
+  const headerSummary = route.view === "internet"
+    ? summarizeSensorStatuses(data.sensors.filter((sensor) => sensor.type === "http"))
+    : data.summary;
 
   const refreshPortSamples = useCallback(async (deviceId, { force = false } = {}) => {
     if (!deviceId) return;
@@ -217,7 +182,7 @@ function App() {
         const thresholdEndpoint = selectedSensor?.type === "snmp_traffic" ? "threshold-rules" : "thresholds";
         const [sensors, samples, threshold] = await Promise.all([
           apiRequest("/api/sensors"),
-          apiRequest(`/api/sensors/${sensorId}/samples`),
+          apiRequest(`/api/sensors/${sensorId}/samples?range=${encodeURIComponent(selectedSensorRange)}&resolution=auto`),
           apiRequest(`/api/sensors/${sensorId}/${thresholdEndpoint}`),
         ]);
         if (cancelled) return;
@@ -237,7 +202,7 @@ function App() {
       cancelled = true;
       window.clearInterval(timer);
     };
-  }, [route.view, route.sensorId, selectedSensor?.type]);
+  }, [route.view, route.sensorId, selectedSensor?.type, selectedSensorRange]);
 
   const runAction = useCallback(async (label, fn) => {
     setPending(label);
@@ -272,11 +237,35 @@ function App() {
     },
     setRoute,
     setDeviceDetailTab: (deviceId, tab) => setDeviceDetailTabs((current) => ({ ...current, [deviceId]: tab })),
+    setSensorSampleRange: (sensorId, range) => setSensorSampleRanges((current) => ({ ...current, [sensorId]: range })),
     refreshPortSamples,
     saveDevice: (payload) => runAction("save-device", () => apiRequest("/api/devices", { method: "POST", body: payload })),
     saveGroup: (payload) => runAction("save-group", () => apiRequest("/api/groups", { method: "POST", body: payload })),
     saveDeviceGroup: (deviceId, payload) => runAction("save-device-group", () => apiRequest(`/api/devices/${deviceId}/group`, { method: "POST", body: payload })),
     saveSensor: (deviceId, payload) => runAction("save-sensor", () => apiRequest(`/api/devices/${deviceId}/sensors`, { method: "POST", body: payload })),
+    saveInternetMonitor: (payload) => runAction("save-internet-monitor", async () => {
+      let device = data.devices.find((item) => item.name === internetDeviceName && item.host === internetDeviceHost);
+      if (!device) {
+        device = await apiRequest("/api/devices", {
+          method: "POST",
+          body: {
+            name: internetDeviceName,
+            host: internetDeviceHost,
+            group: internetDeviceGroup,
+            tags: "system,internet",
+            notes: "System device for HTTP/HTTPS internet monitors.",
+          },
+        });
+      }
+      return apiRequest(`/api/devices/${device.id}/sensors`, {
+        method: "POST",
+        body: {
+          ...payload,
+          type: "http",
+          name: String(payload.name || "").trim() || defaultInternetMonitorName(payload.url),
+        },
+      });
+    }),
     createDiscoveredSensors: (deviceId, payload) => runAction("bulk-sensors", () => apiRequest(`/api/devices/${deviceId}/sensors/bulk`, { method: "POST", body: payload })),
     scanSnmp: (deviceId, payload) => apiRequest(`/api/devices/${deviceId}/snmp/walk`, { method: "POST", body: payload }),
     scanTraffic: (deviceId, payload) => apiRequest(`/api/devices/${deviceId}/interfaces/discover`, { method: "POST", body: payload }),
@@ -315,7 +304,7 @@ function App() {
       setSensorThresholds((current) => ({ ...current, [sensorId]: threshold }));
       return threshold;
     }),
-  }), [data.sensors, loadAuth, loadData, refreshPortSamples, runAction, setRoute]);
+  }), [data.devices, data.sensors, loadAuth, loadData, refreshPortSamples, runAction, setRoute]);
 
   const content = data.loading ? (
     <main className="single-view">{emptyState("Loading", "Fetching live network state...")}</main>
@@ -328,6 +317,7 @@ function App() {
       deviceDetailTab={activeDeviceTab}
       portSamples={portSamples}
       sensorSamples={sensorSamples}
+      sensorSampleRanges={sensorSampleRanges}
       sensorSamplesLoading={sensorSamplesLoading}
       sensorThresholds={sensorThresholds}
       sensorThresholdsLoading={sensorThresholdsLoading}
@@ -345,7 +335,7 @@ function App() {
     <div className="noc-shell">
       <Sidebar data={data} route={route} actions={actions} />
       <div className="noc-main">
-        <Header route={route} summary={data.summary} apiOnline={data.apiOnline} auth={auth} actions={actions} />
+        <Header route={route} summary={headerSummary} apiOnline={data.apiOnline} auth={auth} actions={actions} />
         {toast && <div className="react-toast" role="status">{toast}<button type="button" onClick={() => setToast("")}>{icon("close")}</button></div>}
         {content}
       </div>
@@ -355,13 +345,15 @@ function App() {
 }
 
 function CurrentView(props) {
+  const ui = { StatusBadge, emptyState, formatDateTime, icon, metricCard };
+  if (props.route.view === "internet") return <InternetView {...props} ui={ui} />;
   if (props.route.view === "devices") return <DevicesView {...props} />;
   if (props.route.view === "sensors") return <SensorsView {...props} />;
   if (props.route.view === "events") return <EventsView events={props.data.events} />;
   if (props.route.view === "device-detail") return <DeviceDetail {...props} />;
   if (props.route.view === "sensor-detail") {
     const key = String(props.route.sensorId || "");
-    return <SensorDetail sensor={props.selectedSensor} samples={props.sensorSamples[key] || []} loading={!!props.sensorSamplesLoading[key]} threshold={props.sensorThresholds?.[key]} thresholdLoading={!!props.sensorThresholdsLoading?.[key]} actions={props.actions} pending={props.pending} />;
+    return <SensorDetail sensor={props.selectedSensor} samples={props.sensorSamples[key] || []} sampleRange={props.sensorSampleRanges?.[key] || "1h"} loading={!!props.sensorSamplesLoading[key]} threshold={props.sensorThresholds?.[key]} thresholdLoading={!!props.sensorThresholdsLoading?.[key]} actions={props.actions} pending={props.pending} />;
   }
   return <Dashboard {...props} />;
 }
@@ -402,7 +394,7 @@ function AuthScreen({ auth, setAuth, loadData }) {
 }
 
 function Header({ route, summary, apiOnline, auth, actions }) {
-  const titles = { dashboard: "Command Dashboard", devices: "Device Inventory", sensors: "Sensor Console", events: "Alert Timeline", "device-detail": "Device Detail", "sensor-detail": "Sensor Detail" };
+  const titles = { dashboard: "Command Dashboard", internet: "Internet Monitoring", devices: "Device Inventory", sensors: "Sensor Console", events: "Alert Timeline", "device-detail": "Device Detail", "sensor-detail": "Sensor Detail" };
   return (
     <header className="topbar">
       <div><div className="eyebrow">Local Network Monitoring</div><h1>{titles[route.view] || titles.dashboard}</h1></div>
@@ -423,12 +415,14 @@ function Header({ route, summary, apiOnline, auth, actions }) {
 }
 
 function Sidebar({ data, route, actions }) {
-  const groups = useMemo(() => groupDevices(data.groups, data.devices), [data.groups, data.devices]);
+  const treeDevices = useMemo(() => data.devices.filter((device) => !isInternetSystemDevice(device)), [data.devices]);
+  const groups = useMemo(() => groupDevices(data.groups, treeDevices), [data.groups, treeDevices]);
   return (
     <aside className="sidebar">
       <div className="brand"><div className="brand-mark">NM</div><div><strong>NetworkManager</strong><span>NOC Console</span></div></div>
       <nav className="nav">
         <NavButton active={route.view === "dashboard"} label="Dashboard" iconName="dashboard" onClick={() => actions.setRoute({ view: "dashboard" })} />
+        <NavButton active={route.view === "internet"} label="Internet" iconName="internet" onClick={() => actions.setRoute({ view: "internet" })} />
         <NavButton active={route.view === "devices"} label="Devices" iconName="server" onClick={() => actions.setRoute({ view: "devices" })} />
         <NavButton active={route.view === "sensors"} label="Sensors" iconName="sensor" onClick={() => actions.setRoute({ view: "sensors" })} />
         <NavButton active={route.view === "events"} label="Alerts" iconName="alert" onClick={() => actions.setRoute({ view: "events" })} />
@@ -610,7 +604,7 @@ function EventsView({ events }) {
   return <main className="single-view"><section className="panel"><div className="panel-head"><div><h2>Alerts</h2><p>Failures, warnings, and recovery events.</p></div></div><EventsList events={events} /></section></main>;
 }
 
-function SensorDetail({ sensor, samples = [], loading = false, threshold, thresholdLoading = false, actions, pending }) {
+function SensorDetail({ sensor, samples = [], sampleRange = "1h", loading = false, threshold, thresholdLoading = false, actions, pending }) {
   if (!sensor) return <main className="single-view">{emptyState("Sensor not found", "The selected sensor is not available.")}</main>;
   return (
     <main className="single-view detail-grid">
@@ -630,7 +624,7 @@ function SensorDetail({ sensor, samples = [], loading = false, threshold, thresh
       <div className="sensor-detail-main">
         <section className="panel chart-panel">
           <div className="panel-head"><div><h2>Measurement History</h2><p>{sensor.type === "snmp_traffic" ? "Inbound and outbound interface rate" : "Recent sensor samples"}</p></div><button className="ghost-button" type="button" disabled={pending === `check-${sensor.id}`} onClick={() => actions.checkSensor(sensor.id)}>{icon("play")} Check</button></div>
-          <SensorChart sensor={sensor} samples={samples} loading={loading} />
+          <SensorChart sensor={sensor} samples={samples} sampleRange={sampleRange} onRangeChange={(range) => actions.setSensorSampleRange(sensor.id, range)} loading={loading} />
         </section>
         <ThresholdPanel sensor={sensor} threshold={threshold} loading={thresholdLoading} pending={pending} actions={actions} />
       </div>
@@ -699,12 +693,14 @@ function ThresholdPanel({ sensor, threshold, loading, pending, actions }) {
 function PortThresholdRulesPanel({ sensor, threshold, loading, pending, actions }) {
   const [rules, setRules] = useState(() => normalizeThresholdRules(threshold));
   const [draft, setDraft] = useState(() => defaultPortRule());
+  const [editingRuleKey, setEditingRuleKey] = useState(null);
   const [advanced, setAdvanced] = useState(false);
   const [error, setError] = useState("");
   const [saved, setSaved] = useState("");
   useEffect(() => {
     setRules(normalizeThresholdRules(threshold));
     setDraft(defaultPortRule());
+    setEditingRuleKey(null);
     setAdvanced(false);
     setError("");
     setSaved("");
@@ -716,6 +712,7 @@ function PortThresholdRulesPanel({ sensor, threshold, loading, pending, actions 
   }
   function deleteRule(index) {
     setRules((current) => current.filter((_, position) => position !== index));
+    setEditingRuleKey(null);
     setSaved("");
   }
   function updateDraft(name, value) {
@@ -727,6 +724,7 @@ function PortThresholdRulesPanel({ sensor, threshold, loading, pending, actions 
     const next = normalizeClientThresholdRule(draft);
     setRules((current) => [...current, next]);
     setDraft(defaultPortRule(draft.severity, draft.direction));
+    setEditingRuleKey(null);
     setAdvanced(false);
   }
   async function submit(event) {
@@ -747,18 +745,37 @@ function PortThresholdRulesPanel({ sensor, threshold, loading, pending, actions 
       {loading ? <div className="threshold-loading">Loading threshold rules...</div> : (
         <form onSubmit={submit}>
           <div className="threshold-rule-list">
-            {rules.length ? rules.map((rule, index) => (
-              <article className={`threshold-rule-card ${rule.severity}`} key={rule.clientId || rule.id || index}>
-                <label className="check-label"><input type="checkbox" checked={!!rule.enabled} onChange={(event) => updateRule(index, { enabled: event.target.checked })} /> Enabled</label>
-                <select value={rule.severity} onChange={(event) => updateRule(index, { severity: event.target.value })}><option value="warning">Warning</option><option value="critical">Critical</option></select>
-                <select value={rule.metric} onChange={(event) => updateRule(index, { metric: event.target.value })}>{portMetricOptions().map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select>
-                <select value={rule.direction} onChange={(event) => updateRule(index, { direction: event.target.value })}><option value="above">&gt;</option><option value="below">&lt;</option></select>
-                {rule.mode === "absolute_mbps" ? <label>Mbps<input type="number" min="0" step="0.01" value={rule.absoluteMbps ?? ""} onChange={(event) => updateRule(index, { absoluteMbps: event.target.value })} /></label> : <label>Percent<input type="number" min="0" max="100" step="0.1" value={rule.percent ?? ""} onChange={(event) => updateRule(index, { percent: event.target.value })} /></label>}
-                <select value={rule.mode} onChange={(event) => updateRule(index, event.target.value === "absolute_mbps" ? { mode: "absolute_mbps", absoluteMbps: rule.absoluteMbps ?? percentToMbps(rule.percent, interfaceSpeed), percent: "" } : { mode: "percent", percent: rule.percent || 80, absoluteMbps: "" })}><option value="percent">% of port</option><option value="absolute_mbps">Mbps</option></select>
-                <button className="mini-action danger" type="button" onClick={() => deleteRule(index)}>{icon("trash")} Delete</button>
-                <p>{describeClientRule(rule, interfaceSpeed)}</p>
-              </article>
-            )) : <div className="threshold-empty">No threshold rules yet. Add a warning or critical rule below.</div>}
+            {rules.length ? rules.map((rule, index) => {
+              const key = rule.clientId || rule.id || `rule-${index}`;
+              const editing = editingRuleKey === key;
+              return (
+                <article className={`threshold-rule-card ${rule.severity} ${editing ? "editing" : "readonly"}`} key={key}>
+                  {editing ? (
+                    <>
+                      <div className="threshold-rule-edit-main">
+                        <label className="check-label threshold-rule-enabled"><input type="checkbox" checked={!!rule.enabled} onChange={(event) => updateRule(index, { enabled: event.target.checked })} /> Enabled</label>
+                        <label>Severity<select value={rule.severity} onChange={(event) => updateRule(index, { severity: event.target.value })}><option value="warning">Warning</option><option value="critical">Critical</option></select></label>
+                        <label>Metric<select value={rule.metric} onChange={(event) => updateRule(index, { metric: event.target.value })}>{portMetricOptions().map(([value, label]) => <option key={value} value={value}>{label}</option>)}</select></label>
+                        <label>Condition<select value={rule.direction} onChange={(event) => updateRule(index, { direction: event.target.value })}><option value="above">&gt;</option><option value="below">&lt;</option></select></label>
+                        {rule.mode === "absolute_mbps" ? <label>Mbps<input type="number" min="0" step="0.01" value={rule.absoluteMbps ?? ""} onChange={(event) => updateRule(index, { absoluteMbps: event.target.value })} /></label> : <label>Percent<input type="number" min="0" max="100" step="0.1" value={rule.percent ?? ""} onChange={(event) => updateRule(index, { percent: event.target.value })} /></label>}
+                        <label>Mode<select value={rule.mode} onChange={(event) => updateRule(index, event.target.value === "absolute_mbps" ? { mode: "absolute_mbps", absoluteMbps: rule.absoluteMbps ?? percentToMbps(rule.percent, interfaceSpeed), percent: "" } : { mode: "percent", percent: rule.percent || 80, absoluteMbps: "" })}><option value="percent">% of port speed</option><option value="absolute_mbps">Specific Mbps</option></select></label>
+                      </div>
+                      <div className="threshold-rule-actions edit-actions"><button className="mini-action" type="button" onClick={() => setEditingRuleKey(null)}>Done</button><button className="mini-action danger" type="button" onClick={() => deleteRule(index)}>{icon("trash")} Delete</button></div>
+                      <p className="threshold-rule-preview">{describeClientRule(rule, interfaceSpeed)}</p>
+                    </>
+                  ) : (
+                    <>
+                      <div className="threshold-rule-summary">
+                        <div><strong>{ruleSummaryTitle(rule)}</strong><span>{rule.enabled ? "Enabled" : "Disabled"} · {ruleModeLabel(rule)}</span></div>
+                        <p>{describeClientRule(rule, interfaceSpeed)}</p>
+                      </div>
+                      <div className={`threshold-rule-severity ${rule.severity}`}>{rule.severity === "critical" ? "Critical" : "Warning"}</div>
+                      <div className="threshold-rule-actions"><button className="mini-action" type="button" onClick={() => setEditingRuleKey(key)}>{icon("edit")} Edit</button><button className="mini-action danger" type="button" onClick={() => deleteRule(index)}>{icon("trash")} Delete</button></div>
+                    </>
+                  )}
+                </article>
+              );
+            }) : <div className="threshold-empty">No threshold rules yet. Add a warning or critical rule below.</div>}
           </div>
           <section className="threshold-rule-builder">
             <div className="threshold-builder-head"><strong>Add Rule</strong><span>{describeClientRule(draft, interfaceSpeed)}</span></div>
@@ -790,6 +807,7 @@ function ModalHost({ modal, actions, data }) {
   if (modal.type === "group") return <GroupModal actions={actions} />;
   if (modal.type === "sensor") return <SensorModal device={device} actions={actions} />;
   if (modal.type === "traffic") return <TrafficModal device={device} sensors={data.sensors} actions={actions} />;
+  if (modal.type === "internet-monitor") return <InternetMonitorModal actions={actions} ui={{ ModalShell, FormMessage, ModalActions }} />;
   return null;
 }
 
@@ -1096,9 +1114,15 @@ function PortMiniChart({ samples }) {
   return <span className={`port-mini-chart ${empty ? "empty" : ""}`}><svg viewBox={`0 0 ${width} ${height}`} aria-hidden="true"><line className="port-chart-baseline" x1="0" y1={height - 4} x2={width} y2={height - 4} /><polyline className="port-chart-in" points={inbound} /><polyline className="port-chart-out" points={outbound} /></svg></span>;
 }
 
-function SensorChart({ sensor, samples, loading }) {
+function ChartControlGroup({ label, children, align = "" }) {
+  return <div className={`chart-control-group ${align}`}><span>{label}</span>{children}</div>;
+}
+
+function SensorChart({ sensor, samples, sampleRange = "1h", onRangeChange, loading }) {
   const [trafficAxisMode, setTrafficAxisMode] = useState("port_speed");
+  const [hoverIndex, setHoverIndex] = useState(null);
   useEffect(() => setTrafficAxisMode("port_speed"), [sensor.id]);
+  useEffect(() => setHoverIndex(null), [sensor.id, sampleRange, samples.length]);
   if (loading) return <div className="empty-chart"><span>Loading samples</span></div>;
   if (!samples.length) return <div className="empty-chart"><span>No samples yet</span></div>;
   const domain = chartDomain(samples);
@@ -1111,12 +1135,99 @@ function SensorChart({ sensor, samples, loading }) {
       ? niceAxisMax(measuredMax)
       : Math.max(1, interfaceSpeed || measuredMax, measuredMax);
     const scale = chartScale(axisMax, "rate");
-    return <div className="traffic-chart"><div className="chart-toolbar"><div className="segmented-control chart-axis-toggle" aria-label="Y axis display mode"><button className={trafficAxisMode === "port_speed" ? "active" : ""} type="button" onClick={() => setTrafficAxisMode("port_speed")}>Port Speed</button><button className={trafficAxisMode === "auto_peak" ? "active" : ""} type="button" onClick={() => setTrafficAxisMode("auto_peak")}>Auto Peak</button></div></div><div className="chart-stats"><div><span>Inbound</span><strong>{formatRate(points.at(-1)?.inBps || 0)}</strong></div><div><span>Outbound</span><strong>{formatRate(points.at(-1)?.outBps || 0)}</strong></div><div><span>Peak</span><strong>{formatRate(measuredMax)}</strong></div><div><span>Axis Max</span><strong>{formatRate(axisMax)}</strong></div></div><svg viewBox="0 0 780 330" role="img" aria-label="Interface traffic history"><ChartGrid max={axisMax} scale={scale} domain={domain} /><polyline className="chart-line in" points={chartPoints(points.map((item) => item.inBps), axisMax, visibleSamples, domain)} /><polyline className="chart-line out" points={chartPoints(points.map((item) => item.outBps), axisMax, visibleSamples, domain)} /></svg><div className="chart-legend"><span><i className="legend-in" />Inbound</span><span><i className="legend-out" />Outbound</span></div></div>;
+    const hoverPoints = visibleSamples.map((sample, index) => ({
+      index,
+      sample,
+      x: chartSampleX(sample, index, domain),
+      inBps: points[index]?.inBps || 0,
+      outBps: points[index]?.outBps || 0,
+      inY: chartY(points[index]?.inBps || 0, axisMax),
+      outY: chartY(points[index]?.outBps || 0, axisMax),
+    }));
+    return (
+      <div className="traffic-chart">
+        <div className="chart-toolbar">
+          <ChartControlGroup label="Range"><div className="segmented-control history-range-toggle" aria-label="History range">{sampleRangeOptions.map(([value, label]) => <button className={sampleRange === value ? "active" : ""} key={value} type="button" onClick={() => onRangeChange?.(value)}>{label}</button>)}</div></ChartControlGroup>
+          <ChartControlGroup label="Scale" align="right"><div className="segmented-control chart-axis-toggle" aria-label="Y axis display mode"><button className={trafficAxisMode === "port_speed" ? "active" : ""} type="button" onClick={() => setTrafficAxisMode("port_speed")}>Port Speed</button><button className={trafficAxisMode === "auto_peak" ? "active" : ""} type="button" onClick={() => setTrafficAxisMode("auto_peak")}>Auto Peak</button></div></ChartControlGroup>
+        </div>
+        <div className="chart-stats"><div><span>Inbound</span><strong>{formatRate(points.at(-1)?.inBps || 0)}</strong></div><div><span>Outbound</span><strong>{formatRate(points.at(-1)?.outBps || 0)}</strong></div><div><span>Peak</span><strong>{formatRate(measuredMax)}</strong></div><div><span>Axis Max</span><strong>{formatRate(axisMax)}</strong></div></div>
+        <svg viewBox="0 0 780 330" role="img" aria-label="Interface traffic history" onMouseLeave={() => setHoverIndex(null)}>
+          <ChartGrid max={axisMax} scale={scale} domain={domain} />
+          <polyline className="chart-line in" points={chartPoints(points.map((item) => item.inBps), axisMax, visibleSamples, domain)} />
+          <polyline className="chart-line out" points={chartPoints(points.map((item) => item.outBps), axisMax, visibleSamples, domain)} />
+          <ChartHoverLayer mode="traffic" items={hoverPoints} hoverIndex={hoverIndex} onHover={setHoverIndex} />
+        </svg>
+        <div className="chart-legend"><span><i className="legend-in" />Inbound</span><span><i className="legend-out" />Outbound</span></div>
+      </div>
+    );
   }
   const values = visibleSamples.map((sample) => Number(sample.valueNumber || 0));
   const max = Math.max(1, ...values);
   const scale = chartScale(max, "number", sensor.unit || "");
-  return <div className="traffic-chart"><div className="chart-stats"><div><span>Current</span><strong>{visibleSamples.at(-1)?.valueText || "-"}</strong></div><div><span>Samples</span><strong>{visibleSamples.length}</strong></div><div><span>Peak</span><strong>{max.toLocaleString()}</strong></div><div><span>Axis Max</span><strong>{max.toLocaleString()}</strong></div></div><svg viewBox="0 0 780 330" role="img" aria-label="Sensor sample history"><ChartGrid max={max} scale={scale} domain={domain} /><polyline className="chart-line in" points={chartPoints(values, max, visibleSamples, domain)} /></svg></div>;
+  const hoverPoints = visibleSamples.map((sample, index) => ({
+    index,
+    sample,
+    x: chartSampleX(sample, index, domain),
+    value: values[index] || 0,
+    y: chartY(values[index] || 0, max),
+  }));
+  return (
+    <div className="traffic-chart">
+      <div className="chart-toolbar"><ChartControlGroup label="Range"><div className="segmented-control history-range-toggle" aria-label="History range">{sampleRangeOptions.map(([value, label]) => <button className={sampleRange === value ? "active" : ""} key={value} type="button" onClick={() => onRangeChange?.(value)}>{label}</button>)}</div></ChartControlGroup></div>
+      <div className="chart-stats"><div><span>Current</span><strong>{visibleSamples.at(-1)?.valueText || "-"}</strong></div><div><span>Samples</span><strong>{visibleSamples.length}</strong></div><div><span>Peak</span><strong>{max.toLocaleString()}</strong></div><div><span>Axis Max</span><strong>{max.toLocaleString()}</strong></div></div>
+      <svg viewBox="0 0 780 330" role="img" aria-label="Sensor sample history" onMouseLeave={() => setHoverIndex(null)}>
+        <ChartGrid max={max} scale={scale} domain={domain} />
+        <polyline className="chart-line in" points={chartPoints(values, max, visibleSamples, domain)} />
+        <ChartHoverLayer mode="value" items={hoverPoints} hoverIndex={hoverIndex} onHover={setHoverIndex} />
+      </svg>
+    </div>
+  );
+}
+
+function ChartHoverLayer({ mode, items, hoverIndex, onHover }) {
+  const hover = items.find((item) => item.index === hoverIndex);
+  return (
+    <>
+      {hover ? <ChartTooltip mode={mode} item={hover} /> : null}
+      <g className="chart-hover-targets">
+        {items.map((item) => <line key={item.index} className="chart-hover-target" x1={item.x} x2={item.x} y1={chartPlot.top} y2={chartPlot.bottom} onMouseEnter={() => onHover(item.index)} onMouseMove={() => onHover(item.index)} />)}
+      </g>
+    </>
+  );
+}
+
+function ChartTooltip({ mode, item }) {
+  const isTraffic = mode === "traffic";
+  const markerYs = isTraffic ? [item.inY, item.outY] : [item.y];
+  const anchorY = Math.min(...markerYs);
+  const width = isTraffic ? 188 : 166;
+  const height = isTraffic ? (item.sample?.meta?.rollup ? 84 : 70) : (item.sample?.meta?.rollup ? 72 : 58);
+  const x = clampChartValue(item.x + 12, chartPlot.left + 8, chartPlot.right - width - 8);
+  const y = clampChartValue(anchorY - height - 12, chartPlot.top + 8, chartPlot.bottom - height - 8);
+  const rollup = item.sample?.meta?.rollup;
+  const sampleCount = item.sample?.meta?.sampleCount;
+  return (
+    <g className="chart-hover-layer">
+      <line className="chart-hover-line" x1={item.x} x2={item.x} y1={chartPlot.top} y2={chartPlot.bottom} />
+      {isTraffic ? (
+        <>
+          <circle className="chart-hover-point in" cx={item.x} cy={item.inY} r="4" />
+          <circle className="chart-hover-point out" cx={item.x} cy={item.outY} r="4" />
+        </>
+      ) : <circle className="chart-hover-point in" cx={item.x} cy={item.y} r="4" />}
+      <g className="chart-tooltip" transform={`translate(${x}, ${y})`}>
+        <rect width={width} height={height} rx="7" />
+        <text className="chart-tooltip-time" x="10" y="18">{formatDateTime(item.sample?.createdAt)}</text>
+        {isTraffic ? (
+          <>
+            <text className="chart-tooltip-row" x="10" y="40"><tspan className="chart-tooltip-in">Inbound</tspan><tspan x="82">{formatRate(item.inBps)}</tspan></text>
+            <text className="chart-tooltip-row" x="10" y="58"><tspan className="chart-tooltip-out">Outbound</tspan><tspan x="82">{formatRate(item.outBps)}</tspan></text>
+          </>
+        ) : <text className="chart-tooltip-row" x="10" y="40"><tspan>Value</tspan><tspan x="62">{item.sample?.valueText || item.value.toLocaleString()}</tspan></text>}
+        {rollup ? <text className="chart-tooltip-meta" x="10" y={isTraffic ? 76 : 58}>{rollup} rollup{sampleCount ? `, ${sampleCount} samples` : ""}</text> : null}
+      </g>
+    </g>
+  );
 }
 
 function ChartGrid({ max, scale, domain }) {
@@ -1157,6 +1268,15 @@ function defaultPortRule(severity = "warning", direction = "above") {
     absoluteMbps: "",
     label: "",
   };
+}
+
+function defaultInternetMonitorName(url) {
+  try {
+    const parsed = new URL(String(url || ""));
+    return parsed.hostname || "HTTP Monitor";
+  } catch {
+    return "HTTP Monitor";
+  }
 }
 
 function normalizeThresholdRules(threshold) {
@@ -1201,6 +1321,19 @@ function describeClientRule(rule, interfaceSpeed) {
   return `${severity} when ${metric} ${sign} ${target}${converted}`;
 }
 
+function ruleSummaryTitle(rule) {
+  const metric = Object.fromEntries(portMetricOptions())[rule.metric] || "Max Traffic";
+  const sign = rule.direction === "below" ? "<" : ">";
+  const value = rule.mode === "absolute_mbps"
+    ? `${Number(rule.absoluteMbps || 0).toLocaleString()} Mbps`
+    : `${Number(rule.percent || 0).toLocaleString()}%`;
+  return `${metric} ${sign} ${value}`;
+}
+
+function ruleModeLabel(rule) {
+  return rule.mode === "absolute_mbps" ? "Advanced Mbps rule" : "Port speed percent rule";
+}
+
 function operatorOptions() {
   return [
     ["", "Disabled"],
@@ -1220,13 +1353,29 @@ function thresholdHint(sensor) {
 
 function groupDevices(groups, devices) {
   const map = new Map();
-  groups.forEach((group) => map.set(group.name || "Unassigned", []));
+  groups.forEach((group) => {
+    const name = group.name || "Unassigned";
+    if (name !== internetDeviceGroup) map.set(name, []);
+  });
   devices.forEach((device) => {
     const group = device.group || "Unassigned";
     if (!map.has(group)) map.set(group, []);
     map.get(group).push(device);
   });
   return Array.from(map.entries()).map(([name, groupDevicesList]) => ({ name, devices: groupDevicesList, status: aggregateStatus(groupDevicesList.map((device) => device.status || "unknown")) }));
+}
+
+function isInternetSystemDevice(device) {
+  return String(device?.name || "") === internetDeviceName && String(device?.host || "") === internetDeviceHost;
+}
+
+function summarizeSensorStatuses(sensors) {
+  const summary = { ...emptySummary, sensors: sensors.length };
+  sensors.forEach((sensor) => {
+    const status = statusLabels[sensor.status] ? sensor.status : "unknown";
+    summary[status] = (summary[status] || 0) + 1;
+  });
+  return summary;
 }
 
 function existingTrafficKeys(sensors, deviceId) {
@@ -1303,11 +1452,23 @@ function miniChartPoints(values, max, width, height) {
 
 function chartPoints(values, max, samples, domain) {
   return values.map((value, index) => {
-    const time = new Date(samples[index]?.createdAt || "").getTime();
-    const x = chartX(Number.isFinite(time) ? time : domain.start + index * chartTimeStepMs, domain);
-    const y = chartPlot.bottom - (Number(value || 0) / max) * chartPlot.height;
+    const x = chartSampleX(samples[index], index, domain);
+    const y = chartY(value, max);
     return `${x.toFixed(1)},${y.toFixed(1)}`;
   }).join(" ");
+}
+
+function chartSampleX(sample, index, domain) {
+  const time = new Date(sample?.createdAt || "").getTime();
+  return chartX(Number.isFinite(time) ? time : domain.start + index * chartTimeStepMs, domain);
+}
+
+function chartY(value, max) {
+  return chartPlot.bottom - (Number(value || 0) / Math.max(1, max)) * chartPlot.height;
+}
+
+function clampChartValue(value, min, max) {
+  return Math.min(max, Math.max(min, value));
 }
 
 function chartDomain(samples) {
@@ -1315,9 +1476,10 @@ function chartDomain(samples) {
   const now = Date.now();
   const minTime = times.length ? Math.min(...times) : now - chartTimeStepMs;
   const maxTime = times.length ? Math.max(...times) : now;
-  const rawStart = Math.floor(minTime / chartTimeStepMs) * chartTimeStepMs;
-  let end = Math.ceil(maxTime / chartTimeStepMs) * chartTimeStepMs;
-  let start = Math.max(rawStart, end - chartVisibleWindowMs);
+  const duration = Math.max(chartTimeStepMs, maxTime - minTime);
+  const padding = Math.max(chartTimeStepMs, duration * 0.03);
+  let start = minTime - padding;
+  let end = maxTime + padding;
   if (end <= start) end = start + chartTimeStepMs;
   return { start, end };
 }
@@ -1336,8 +1498,18 @@ function chartX(time, domain) {
 
 function chartTimeTicks(domain) {
   const ticks = [];
-  for (let time = domain.start; time <= domain.end + 1; time += chartTimeStepMs) ticks.push({ time, label: formatChartTimeLabel(time), x: chartX(time, domain) });
+  const duration = Math.max(chartTimeStepMs, domain.end - domain.start);
+  const step = chartTickStep(duration);
+  const first = Math.ceil(domain.start / step) * step;
+  for (let time = first; time <= domain.end + 1; time += step) ticks.push({ time, label: formatChartTimeLabel(time, duration), x: chartX(time, domain) });
   return ticks;
+}
+
+function chartTickStep(duration) {
+  if (duration <= 2 * 60 * 60 * 1000) return 10 * 60 * 1000;
+  if (duration <= 36 * 60 * 60 * 1000) return 4 * 60 * 60 * 1000;
+  if (duration <= 10 * 24 * 60 * 60 * 1000) return 24 * 60 * 60 * 1000;
+  return 5 * 24 * 60 * 60 * 1000;
 }
 
 function chartScale(max, type, unit = "") {
@@ -1388,10 +1560,12 @@ function formatAxisValue(value, scale) {
   return scaled.toFixed(2);
 }
 
-function formatChartTimeLabel(value) {
+function formatChartTimeLabel(value, duration = 0) {
   const date = new Date(value || "");
   if (Number.isNaN(date.getTime())) return "-";
-  return `${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
+  if (duration > 36 * 60 * 60 * 1000) return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")}`;
+  if (duration > 2 * 60 * 60 * 1000) return `${String(date.getDate()).padStart(2, "0")}/${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
+  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
 }
 
 function formatDateTime(value) {

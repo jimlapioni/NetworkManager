@@ -36,6 +36,12 @@ SNMP_WALK_LIMIT = 128
 SNMP_TABLE_WALK_LIMIT = 4096
 SENSOR_BATCH_LIMIT = 8
 TRAFFIC_DEVICE_BATCH_LIMIT = 2
+MAINTENANCE_INTERVAL_SECONDS = 300
+RAW_SAMPLE_RETENTION_SECONDS = 7 * 24 * 60 * 60
+ROLLUP_RETENTION_SECONDS = {"5m": 30 * 24 * 60 * 60, "1h": 180 * 24 * 60 * 60, "1d": 180 * 24 * 60 * 60}
+ROLLUP_BUCKET_SECONDS = {"5m": 5 * 60, "1h": 60 * 60, "1d": 24 * 60 * 60}
+SAMPLE_RANGE_SECONDS = {"1h": 60 * 60, "24h": 24 * 60 * 60, "7d": 7 * 24 * 60 * 60, "30d": 30 * 24 * 60 * 60, "180d": 180 * 24 * 60 * 60}
+SAMPLE_AUTO_RESOLUTION = {"1h": "raw", "24h": "5m", "7d": "1h", "30d": "1h", "180d": "1d"}
 AUTH_DISABLED = os.environ.get("NETWORK_MANAGER_AUTH_DISABLED", "").lower() in {"1", "true", "yes", "on"}
 PASSWORD_ITERATIONS = 210_000
 IF_DESCR_OID = "1.3.6.1.2.1.2.2.1.2"
@@ -53,6 +59,19 @@ def static_root() -> Path:
 
 def now_iso() -> str:
     return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def iso_at(timestamp: float) -> str:
+    return datetime.fromtimestamp(timestamp, timezone.utc).astimezone().isoformat(timespec="seconds")
+
+
+def parse_iso_timestamp(value: str) -> float:
+    if not value:
+        return 0
+    try:
+        return datetime.fromisoformat(value).timestamp()
+    except ValueError:
+        return 0
 
 
 def db() -> sqlite3.Connection:
@@ -211,6 +230,11 @@ def init_db() -> None:
                 UNIQUE(sensor_id, bucket, bucket_start),
                 FOREIGN KEY(sensor_id) REFERENCES sensors(id) ON DELETE CASCADE
             );
+
+            CREATE INDEX IF NOT EXISTS idx_samples_sensor_created ON samples(sensor_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_samples_created ON samples(created_at);
+            CREATE INDEX IF NOT EXISTS idx_sample_rollups_sensor_bucket_start ON sample_rollups(sensor_id, bucket, bucket_start);
+            CREATE INDEX IF NOT EXISTS idx_sample_rollups_bucket_start ON sample_rollups(bucket, bucket_start);
             """
         )
         ensure_column(connection, "devices", "topology_x", "REAL")
@@ -522,6 +546,49 @@ def row_to_sample(row: sqlite3.Row) -> dict:
         "meta": meta,
         "createdAt": row["created_at"],
     }
+
+
+def row_to_rollup_sample(row: sqlite3.Row) -> dict:
+    meta = json.loads(row["meta_json"] or "{}")
+    in_bps = meta.get("maxInBps")
+    out_bps = meta.get("maxOutBps")
+    if in_bps is not None or out_bps is not None:
+        meta["inBps"] = NumberSafe(in_bps)
+        meta["outBps"] = NumberSafe(out_bps)
+        value_number = max(NumberSafe(in_bps), NumberSafe(out_bps))
+        value_text = f"In {format_bps(NumberSafe(in_bps))} / Out {format_bps(NumberSafe(out_bps))}"
+    else:
+        value_number = row["avg_value"]
+        value_text = "-" if value_number is None else f"{value_number:g}"
+    meta["rollup"] = row["bucket"]
+    meta["sampleCount"] = row["sample_count"]
+    return {
+        "id": f"{row['bucket']}:{row['sensor_id']}:{row['bucket_start']}",
+        "sensorId": row["sensor_id"],
+        "status": row["status"],
+        "valueText": value_text,
+        "valueNumber": value_number,
+        "meta": meta,
+        "createdAt": row["bucket_start"],
+    }
+
+
+def NumberSafe(value) -> float:
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def format_bps(value: float) -> str:
+    current = float(value or 0)
+    unit = "bps"
+    for candidate in ("Kbps", "Mbps", "Gbps", "Tbps"):
+        if abs(current) < 1000:
+            break
+        current /= 1000
+        unit = candidate
+    return f"{current:.2f} {unit}"
 
 
 def default_threshold_metric(sensor_type: str) -> str:
@@ -1095,6 +1162,11 @@ def query_limit_offset(filters: dict, default_limit: int = 500) -> tuple[int, in
     return limit, offset
 
 
+def query_flag(filters: dict, key: str) -> bool:
+    value = str(filters.get(key) or "").strip().lower()
+    return value in {"1", "true", "yes", "on"}
+
+
 def get_devices(filters: dict | None = None) -> list[dict]:
     filters = filters or {}
     where = []
@@ -1119,7 +1191,7 @@ def get_devices(filters: dict | None = None) -> list[dict]:
         return [row_to_device(row) for row in rows]
 
 
-def get_sensors(filters: dict | None = None) -> list[dict]:
+def sensor_filter_clause(filters: dict | None = None) -> tuple[str, list]:
     filters = filters or {}
     where = []
     params = []
@@ -1128,10 +1200,15 @@ def get_sensors(filters: dict | None = None) -> list[dict]:
     sensor_type = str(filters.get("type") or "").strip()
     device_id = str(filters.get("deviceId") or filters.get("device_id") or "").strip()
     if q:
-        where.append("(sensors.name LIKE ? OR sensors.type LIKE ? OR sensors.last_value LIKE ? OR devices.name LIKE ? OR devices.host LIKE ?)")
+        where.append(
+            "("
+            "sensors.name LIKE ? OR sensors.type LIKE ? OR sensors.last_value LIKE ? OR "
+            "sensors.config_json LIKE ? OR devices.name LIKE ? OR devices.host LIKE ? OR devices.group_name LIKE ?"
+            ")"
+        )
         like = f"%{q}%"
-        params.extend([like, like, like, like, like])
-    if status:
+        params.extend([like, like, like, like, like, like, like])
+    if status and status != "all":
         where.append("sensors.status = ?")
         params.append(status)
     if sensor_type:
@@ -1140,15 +1217,41 @@ def get_sensors(filters: dict | None = None) -> list[dict]:
     if device_id:
         where.append("sensors.device_id = ?")
         params.append(int(device_id))
+    return (" WHERE " + " AND ".join(where)) if where else "", params
+
+
+def get_sensors(filters: dict | None = None) -> list[dict]:
+    filters = filters or {}
+    where_sql, params = sensor_filter_clause(filters)
     limit, offset = query_limit_offset(filters)
     sql = "SELECT sensors.* FROM sensors LEFT JOIN devices ON devices.id = sensors.device_id"
-    if where:
-        sql += " WHERE " + " AND ".join(where)
+    sql += where_sql
     sql += " ORDER BY sensors.id DESC LIMIT ? OFFSET ?"
-    params.extend([limit, offset])
     with DB_LOCK, db() as connection:
-        rows = connection.execute(sql, params).fetchall()
+        rows = connection.execute(sql, [*params, limit, offset]).fetchall()
         return [row_to_sensor(row) for row in rows]
+
+
+def get_sensors_page(filters: dict | None = None) -> dict:
+    filters = filters or {}
+    where_sql, params = sensor_filter_clause(filters)
+    limit, offset = query_limit_offset(filters)
+    base_sql = " FROM sensors LEFT JOIN devices ON devices.id = sensors.device_id" + where_sql
+    with DB_LOCK, db() as connection:
+        rows = connection.execute(
+            "SELECT sensors.*" + base_sql + " ORDER BY sensors.id DESC LIMIT ? OFFSET ?",
+            [*params, limit, offset],
+        ).fetchall()
+        total = int(connection.execute("SELECT COUNT(*) AS total" + base_sql, params).fetchone()["total"])
+        status_rows = connection.execute(
+            "SELECT sensors.status AS status, COUNT(*) AS total" + base_sql + " GROUP BY sensors.status",
+            params,
+        ).fetchall()
+    summary = {"up": 0, "warning": 0, "down": 0, "unknown": 0, "paused": 0, "total": total}
+    for row in status_rows:
+        status = row["status"] if row["status"] in summary else "unknown"
+        summary[status] += int(row["total"] or 0)
+    return {"items": [row_to_sensor(row) for row in rows], "total": total, "limit": limit, "offset": offset, "summary": summary}
 
 
 def get_events(limit: int = 80, filters: dict | None = None) -> list[dict]:
@@ -1179,7 +1282,207 @@ def get_events(limit: int = 80, filters: dict | None = None) -> list[dict]:
         return [row_to_event(row) for row in rows]
 
 
-def get_sensor_samples(sensor_id: int, limit: int = 80) -> list[dict]:
+def status_severity(status: str) -> int:
+    return {"up": 0, "paused": 1, "unknown": 2, "warning": 3, "down": 4}.get(status or "unknown", 2)
+
+
+def bucket_start_iso(timestamp: float, bucket_seconds: int) -> str:
+    return iso_at((int(timestamp) // bucket_seconds) * bucket_seconds)
+
+
+def aggregate_rollup_items(sensor_id: int, bucket: str, bucket_start: str, items: list[dict]) -> dict | None:
+    if not items:
+        return None
+    sample_count = sum(int(item.get("sampleCount") or 1) for item in items)
+    status = max((str(item.get("status") or "unknown") for item in items), key=status_severity)
+    numeric_items = [item for item in items if item.get("avgValue") is not None]
+    avg_value = None
+    min_value = None
+    max_value = None
+    if numeric_items and sample_count:
+        weighted_sum = sum(float(item["avgValue"]) * int(item.get("sampleCount") or 1) for item in numeric_items)
+        weighted_count = sum(int(item.get("sampleCount") or 1) for item in numeric_items)
+        if weighted_count:
+            avg_value = weighted_sum / weighted_count
+        min_candidates = [item.get("minValue") for item in numeric_items if item.get("minValue") is not None]
+        max_candidates = [item.get("maxValue") for item in numeric_items if item.get("maxValue") is not None]
+        min_value = min(min_candidates) if min_candidates else None
+        max_value = max(max_candidates) if max_candidates else None
+    traffic_items = [item for item in items if item.get("avgInBps") is not None or item.get("avgOutBps") is not None or item.get("maxInBps") is not None or item.get("maxOutBps") is not None]
+    meta = {}
+    if traffic_items:
+        traffic_count = sum(int(item.get("sampleCount") or 1) for item in traffic_items)
+        if traffic_count:
+            meta["avgInBps"] = sum(NumberSafe(item.get("avgInBps")) * int(item.get("sampleCount") or 1) for item in traffic_items) / traffic_count
+            meta["avgOutBps"] = sum(NumberSafe(item.get("avgOutBps")) * int(item.get("sampleCount") or 1) for item in traffic_items) / traffic_count
+        meta["maxInBps"] = max(NumberSafe(item.get("maxInBps")) for item in traffic_items)
+        meta["maxOutBps"] = max(NumberSafe(item.get("maxOutBps")) for item in traffic_items)
+        speeds = [NumberSafe(item.get("interfaceSpeed")) for item in traffic_items if NumberSafe(item.get("interfaceSpeed")) > 0]
+        if speeds:
+            meta["interfaceSpeed"] = max(speeds)
+    return {
+        "sensor_id": sensor_id,
+        "bucket": bucket,
+        "bucket_start": bucket_start,
+        "status": status,
+        "avg_value": avg_value,
+        "min_value": min_value,
+        "max_value": max_value,
+        "sample_count": sample_count,
+        "meta_json": json.dumps(meta),
+        "created_at": now_iso(),
+    }
+
+
+def sample_rollup_input(row: sqlite3.Row) -> dict:
+    meta = json.loads(row["meta_json"] or "{}") if "meta_json" in row.keys() else {}
+    value = row["value_number"]
+    in_bps = meta.get("inBps")
+    out_bps = meta.get("outBps")
+    return {
+        "status": row["status"],
+        "sampleCount": 1,
+        "avgValue": value,
+        "minValue": value,
+        "maxValue": value,
+        "avgInBps": in_bps,
+        "maxInBps": in_bps,
+        "avgOutBps": out_bps,
+        "maxOutBps": out_bps,
+        "interfaceSpeed": meta.get("interfaceSpeed"),
+    }
+
+
+def rollup_rollup_input(row: sqlite3.Row) -> dict:
+    meta = json.loads(row["meta_json"] or "{}")
+    return {
+        "status": row["status"],
+        "sampleCount": row["sample_count"],
+        "avgValue": row["avg_value"],
+        "minValue": row["min_value"],
+        "maxValue": row["max_value"],
+        "avgInBps": meta.get("avgInBps"),
+        "maxInBps": meta.get("maxInBps"),
+        "avgOutBps": meta.get("avgOutBps"),
+        "maxOutBps": meta.get("maxOutBps"),
+        "interfaceSpeed": meta.get("interfaceSpeed"),
+    }
+
+
+def upsert_rollups(connection: sqlite3.Connection, rows: list[dict]) -> None:
+    for row in rows:
+        connection.execute(
+            """
+            INSERT INTO sample_rollups
+                (sensor_id, bucket, bucket_start, status, avg_value, min_value, max_value, sample_count, meta_json, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(sensor_id, bucket, bucket_start) DO UPDATE SET
+                status = excluded.status,
+                avg_value = excluded.avg_value,
+                min_value = excluded.min_value,
+                max_value = excluded.max_value,
+                sample_count = excluded.sample_count,
+                meta_json = excluded.meta_json,
+                created_at = excluded.created_at
+            """,
+            (
+                row["sensor_id"],
+                row["bucket"],
+                row["bucket_start"],
+                row["status"],
+                row["avg_value"],
+                row["min_value"],
+                row["max_value"],
+                row["sample_count"],
+                row["meta_json"],
+                row["created_at"],
+            ),
+        )
+
+
+def build_sample_rollups(connection: sqlite3.Connection, now_ts: float) -> None:
+    cutoff = bucket_start_iso(now_ts, ROLLUP_BUCKET_SECONDS["5m"])
+    rows = connection.execute("SELECT * FROM samples WHERE created_at < ? ORDER BY sensor_id, created_at", (cutoff,)).fetchall()
+    grouped: dict[tuple[int, str], list[dict]] = {}
+    for row in rows:
+        bucket_start = bucket_start_iso(parse_iso_timestamp(row["created_at"]), ROLLUP_BUCKET_SECONDS["5m"])
+        grouped.setdefault((int(row["sensor_id"]), bucket_start), []).append(sample_rollup_input(row))
+    upsert_rollups(connection, [aggregate_rollup_items(sensor_id, "5m", bucket_start, items) for (sensor_id, bucket_start), items in grouped.items() if items])
+
+
+def build_rollup_from_rollups(connection: sqlite3.Connection, source_bucket: str, target_bucket: str, now_ts: float) -> None:
+    cutoff = bucket_start_iso(now_ts, ROLLUP_BUCKET_SECONDS[target_bucket])
+    rows = connection.execute(
+        "SELECT * FROM sample_rollups WHERE bucket = ? AND bucket_start < ? ORDER BY sensor_id, bucket_start",
+        (source_bucket, cutoff),
+    ).fetchall()
+    grouped: dict[tuple[int, str], list[dict]] = {}
+    for row in rows:
+        bucket_start = bucket_start_iso(parse_iso_timestamp(row["bucket_start"]), ROLLUP_BUCKET_SECONDS[target_bucket])
+        grouped.setdefault((int(row["sensor_id"]), bucket_start), []).append(rollup_rollup_input(row))
+    upsert_rollups(connection, [aggregate_rollup_items(sensor_id, target_bucket, bucket_start, items) for (sensor_id, bucket_start), items in grouped.items() if items])
+
+
+def cleanup_sample_retention(connection: sqlite3.Connection, now_ts: float) -> None:
+    connection.execute("DELETE FROM samples WHERE created_at < ?", (iso_at(now_ts - RAW_SAMPLE_RETENTION_SECONDS),))
+    for bucket, retention in ROLLUP_RETENTION_SECONDS.items():
+        connection.execute("DELETE FROM sample_rollups WHERE bucket = ? AND bucket_start < ?", (bucket, iso_at(now_ts - retention)))
+
+
+def run_sample_maintenance_once() -> None:
+    now_ts = time.time()
+    with DB_LOCK, db() as connection:
+        build_sample_rollups(connection, now_ts)
+        build_rollup_from_rollups(connection, "5m", "1h", now_ts)
+        build_rollup_from_rollups(connection, "1h", "1d", now_ts)
+        cleanup_sample_retention(connection, now_ts)
+
+
+def sample_maintenance() -> None:
+    while True:
+        try:
+            run_sample_maintenance_once()
+        except Exception:
+            pass
+        time.sleep(MAINTENANCE_INTERVAL_SECONDS)
+
+
+def choose_sample_resolution(time_range: str, resolution: str) -> str:
+    if resolution == "auto":
+        return SAMPLE_AUTO_RESOLUTION[time_range]
+    if resolution not in {"raw", "5m", "1h", "1d"}:
+        raise ValueError("Unsupported sample resolution.")
+    return resolution
+
+
+def get_sensor_samples(sensor_id: int, limit: int = 80, filters: dict | None = None) -> list[dict]:
+    filters = filters or {}
+    if "range" in filters or "resolution" in filters:
+        time_range = str(filters.get("range") or "1h")
+        if time_range not in SAMPLE_RANGE_SECONDS:
+            raise ValueError("Unsupported sample range.")
+        resolution = choose_sample_resolution(time_range, str(filters.get("resolution") or "auto"))
+        start_at = iso_at(time.time() - SAMPLE_RANGE_SECONDS[time_range])
+        with DB_LOCK, db() as connection:
+            sensor = connection.execute("SELECT id FROM sensors WHERE id = ?", (sensor_id,)).fetchone()
+            if not sensor:
+                raise ValueError("Sensor not found.")
+            if resolution == "raw":
+                rows = connection.execute(
+                    "SELECT * FROM samples WHERE sensor_id = ? AND created_at >= ? ORDER BY created_at ASC LIMIT 5000",
+                    (sensor_id, start_at),
+                ).fetchall()
+                return [row_to_sample(row) for row in rows]
+            rows = connection.execute(
+                """
+                SELECT * FROM sample_rollups
+                WHERE sensor_id = ? AND bucket = ? AND bucket_start >= ?
+                ORDER BY bucket_start ASC
+                LIMIT 5000
+                """,
+                (sensor_id, resolution, start_at),
+            ).fetchall()
+            return [row_to_rollup_sample(row) for row in rows]
     limit = min(max(1, int(limit or 80)), 240)
     with DB_LOCK, db() as connection:
         rows = connection.execute(
@@ -1640,6 +1943,7 @@ def delete_device(device_id: int) -> dict:
         sensor_ids = [row["id"] for row in sensor_rows]
         for sensor_id in sensor_ids:
             connection.execute("DELETE FROM samples WHERE sensor_id = ?", (sensor_id,))
+            connection.execute("DELETE FROM sample_rollups WHERE sensor_id = ?", (sensor_id,))
         connection.execute("DELETE FROM events WHERE device_id = ?", (device_id,))
         connection.execute("DELETE FROM sensors WHERE device_id = ?", (device_id,))
         connection.execute("DELETE FROM devices WHERE id = ?", (device_id,))
@@ -1654,6 +1958,7 @@ def delete_group(group_name: str) -> dict:
             sensor_rows = connection.execute("SELECT id FROM sensors WHERE device_id = ?", (device_id,)).fetchall()
             for sensor_row in sensor_rows:
                 connection.execute("DELETE FROM samples WHERE sensor_id = ?", (sensor_row["id"],))
+                connection.execute("DELETE FROM sample_rollups WHERE sensor_id = ?", (sensor_row["id"],))
             connection.execute("DELETE FROM events WHERE device_id = ?", (device_id,))
             connection.execute("DELETE FROM sensors WHERE device_id = ?", (device_id,))
             connection.execute("DELETE FROM devices WHERE id = ?", (device_id,))
@@ -1676,6 +1981,7 @@ def delete_sensor(sensor_id: int) -> dict:
             raise ValueError("Sensor not found.")
         device_id = row["device_id"]
         connection.execute("DELETE FROM samples WHERE sensor_id = ?", (sensor_id,))
+        connection.execute("DELETE FROM sample_rollups WHERE sensor_id = ?", (sensor_id,))
         connection.execute("DELETE FROM events WHERE sensor_id = ?", (sensor_id,))
         connection.execute("DELETE FROM sensors WHERE id = ?", (sensor_id,))
         update_device_status(connection, device_id)
@@ -2447,6 +2753,9 @@ class Handler(SimpleHTTPRequestHandler):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=str(static_root()), **kwargs)
 
+    def log_message(self, format: str, *args) -> None:
+        return
+
     def public_api_path(self, path: str) -> bool:
         return path in {"/api/auth/login", "/api/auth/logout", "/api/auth/setup", "/api/auth/me"}
 
@@ -2477,6 +2786,10 @@ class Handler(SimpleHTTPRequestHandler):
     def do_GET(self) -> None:
         parsed_url = urlparse(self.path)
         path = parsed_url.path
+        if path == "/favicon.ico":
+            self.send_response(204)
+            self.end_headers()
+            return
         if not self.require_api_auth(path):
             return self.send_auth_required()
         query = {key: values[-1] for key, values in parse_qs(parsed_url.query).items()}
@@ -2491,6 +2804,8 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/groups":
                 return self.send_json(get_groups())
             if path == "/api/sensors":
+                if query_flag(query, "includeTotal"):
+                    return self.send_json(get_sensors_page(query))
                 return self.send_json(get_sensors(query))
             if path == "/api/events":
                 return self.send_json(get_events(filters=query))
@@ -2502,7 +2817,7 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(list_notification_deliveries(int(query.get("limit") or 80)))
             match = re.fullmatch(r"/api/sensors/(\d+)/samples", path)
             if match:
-                return self.send_json(get_sensor_samples(int(match.group(1))))
+                return self.send_json(get_sensor_samples(int(match.group(1)), filters=query))
             match = re.fullmatch(r"/api/sensors/(\d+)/thresholds", path)
             if match:
                 return self.send_json(get_sensor_threshold(int(match.group(1))))
@@ -2668,6 +2983,7 @@ class Handler(SimpleHTTPRequestHandler):
 def main() -> None:
     init_db()
     threading.Thread(target=scheduler, daemon=True).start()
+    threading.Thread(target=sample_maintenance, daemon=True).start()
     server = ThreadingHTTPServer((HTTP_HOST, HTTP_PORT), Handler)
     display_host = "127.0.0.1" if HTTP_HOST in {"", "0.0.0.0"} else HTTP_HOST
     print(f"NetworkManager running at http://{display_host}:{HTTP_PORT}")
