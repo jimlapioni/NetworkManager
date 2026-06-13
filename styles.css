@@ -1030,6 +1030,98 @@ h2 {
   margin: 0;
 }
 
+.discovered-list-panel {
+  border-top: 1px solid var(--line);
+  padding: 14px 18px 16px;
+  display: grid;
+  gap: 10px;
+  background: rgba(7, 16, 22, 0.18);
+}
+
+.discovered-list-head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 12px;
+}
+
+.discovered-list-head div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.discovered-list-head strong {
+  color: var(--text);
+  font-size: 15px;
+}
+
+.discovered-list-head span,
+.discovered-empty {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.discovered-list-head small {
+  min-width: 30px;
+  border-radius: 999px;
+  padding: 3px 9px;
+  text-align: center;
+  background: rgba(255, 199, 89, 0.12);
+  color: var(--amber);
+  font-weight: 850;
+}
+
+.discovered-list {
+  display: grid;
+  gap: 7px;
+  max-height: 260px;
+  overflow: auto;
+  padding-right: 4px;
+}
+
+.discovered-row {
+  display: grid;
+  grid-template-columns: minmax(180px, 1.4fr) minmax(220px, 1.5fr) auto;
+  align-items: center;
+  gap: 12px;
+  border: 1px solid rgba(255, 199, 89, 0.24);
+  border-radius: 8px;
+  padding: 10px 11px;
+  background: rgba(255, 199, 89, 0.045);
+}
+
+.discovered-main,
+.discovered-path {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+
+.discovered-main strong {
+  color: var(--text);
+  font-size: 14px;
+}
+
+.discovered-main span,
+.discovered-path span {
+  color: var(--muted);
+  font-size: 12px;
+}
+
+.discovered-main strong,
+.discovered-main span,
+.discovered-path span {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.discovered-path b {
+  color: var(--text);
+  font-weight: 850;
+}
+
 .topology-node.dragging {
   cursor: grabbing;
   border-color: rgba(54, 216, 255, 0.78);

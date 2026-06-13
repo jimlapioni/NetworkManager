@@ -47,7 +47,7 @@ function icon(name) {
 
 function App() {
   const [route, setRouteState] = useState(() => parseRouteHash());
-  const [data, setData] = useState({ loading: true, apiOnline: false, summary: emptySummary, devices: [], groups: [], sensors: [], events: [], topologyLinks: [] });
+  const [data, setData] = useState({ loading: true, apiOnline: false, summary: emptySummary, devices: [], groups: [], sensors: [], events: [], topologyLinks: [], discoveredNodes: [] });
   const [auth, setAuth] = useState({ loading: true, authenticated: false, setupRequired: false, authDisabled: false, user: null, error: "" });
   const [modal, setModal] = useState(null);
   const [deviceDetailTabs, setDeviceDetailTabs] = useState({});
@@ -82,13 +82,14 @@ function App() {
   const loadData = useCallback(async ({ showLoading = false } = {}) => {
     if (showLoading) setData((current) => ({ ...current, loading: true }));
     try {
-      const [summary, devices, groups, sensors, events, topologyLinks] = await Promise.all([
+      const [summary, devices, groups, sensors, events, topologyLinks, discoveredNodes] = await Promise.all([
         apiRequest("/api/summary"),
         apiRequest("/api/devices"),
         apiRequest("/api/groups"),
         apiRequest("/api/sensors"),
         apiRequest("/api/events"),
         apiRequest("/api/topology/links"),
+        apiRequest("/api/discovered-nodes"),
       ]);
       setData({
         loading: false,
@@ -99,6 +100,7 @@ function App() {
         sensors: normalizeList(sensors),
         events: normalizeList(events),
         topologyLinks: normalizeList(topologyLinks),
+        discoveredNodes: normalizeList(discoveredNodes),
       });
     } catch (error) {
       setData((current) => ({ ...current, loading: false, apiOnline: false }));
@@ -239,7 +241,7 @@ function App() {
       }
       window.localStorage.removeItem(authTokenStorageKey);
       setAuth({ loading: false, authenticated: false, setupRequired: false, authDisabled: false, user: null, error: "" });
-      setData((current) => ({ ...current, apiOnline: false, devices: [], groups: [], sensors: [], events: [], topologyLinks: [], summary: emptySummary }));
+      setData((current) => ({ ...current, apiOnline: false, devices: [], groups: [], sensors: [], events: [], topologyLinks: [], discoveredNodes: [], summary: emptySummary }));
       setTopologyDiscovery(null);
     },
     setRoute,
@@ -318,6 +320,10 @@ function App() {
         throw error;
       }
     }),
+    keepDiscoveredNode: (node) => runAction(`keep-discovered-${node.id}`, () => apiRequest(`/api/discovered-nodes/${node.id}/unignore`, { method: "POST", body: {} })),
+    ignoreDiscoveredNode: (node) => runAction(`ignore-discovered-${node.id}`, () => apiRequest(`/api/discovered-nodes/${node.id}/ignore`, { method: "POST", body: {} })),
+    mapDiscoveredNode: (node, deviceId) => runAction(`map-discovered-${node.id}`, () => apiRequest(`/api/discovered-nodes/${node.id}/map`, { method: "POST", body: { deviceId } })),
+    promoteDiscoveredNode: (node, payload) => runAction(`promote-discovered-${node.id}`, () => apiRequest(`/api/discovered-nodes/${node.id}/promote`, { method: "POST", body: payload })),
     saveThreshold: (sensorId, payload) => runAction(`threshold-${sensorId}`, async () => {
       const threshold = await apiRequest(`/api/sensors/${sensorId}/thresholds`, { method: "PUT", body: payload });
       setSensorThresholds((current) => ({ ...current, [sensorId]: threshold }));
@@ -365,7 +371,7 @@ function App() {
         {toast && <div className="react-toast" role="status">{toast}<button type="button" onClick={() => setToast("")}>{icon("close")}</button></div>}
         {content}
       </div>
-      <ModalHost modal={modal} actions={actions} data={data} />
+      <ModalHost modal={modal} actions={actions} data={data} pending={pending} />
     </div>
   );
 }
@@ -505,6 +511,7 @@ function Dashboard({ data, actions, pending, topologyDiscovery }) {
             </div>
           </div>
           <Topology devices={data.devices} links={data.topologyLinks} actions={actions} />
+          <DiscoveredNodesList nodes={data.discoveredNodes} devices={data.devices} />
         </div>
         <div className="panel alert-panel"><div className="panel-head"><div><h2>Alert Timeline</h2><p>Recent status transitions</p></div></div><EventsList events={data.events.slice(0, 8)} /></div>
         <div className="panel table-panel">
@@ -516,18 +523,18 @@ function Dashboard({ data, actions, pending, topologyDiscovery }) {
   );
 }
 
-function LldpDiscoveryModal({ modal, devices, actions }) {
+function LldpDiscoveryModal({ modal, devices, discoveredNodes = [], actions, pending }) {
   const result = modal?.result || null;
   const scanning = !!modal?.scanning;
   return (
     <ModalShell title="LLDP Discovery Results" caption="Matched devices, unknown neighbors, and LLDP scan errors." actions={actions} wide className="lldp-modal-card">
-      <TopologyDiscoveryResult result={result} devices={devices} scanning={scanning} showTitle={false} />
+      <TopologyDiscoveryResult result={result} devices={devices} discoveredNodes={discoveredNodes} actions={actions} pending={pending} scanning={scanning} showTitle={false} />
       {!scanning && <div className="modal-actions"><button className="primary-button" type="button" onClick={actions.closeModal}>Done</button></div>}
     </ModalShell>
   );
 }
 
-function TopologyDiscoveryResult({ result, devices = [], scanning = false, showTitle = true }) {
+function TopologyDiscoveryResult({ result, devices = [], discoveredNodes = [], actions, pending, scanning = false, showTitle = true }) {
   if (scanning) {
     return (
       <div className="lldp-discovery-result scanning">
@@ -539,13 +546,14 @@ function TopologyDiscoveryResult({ result, devices = [], scanning = false, showT
   }
   if (!result) return null;
   const summary = result.summary || {};
-  const discovered = (result.results || []).flatMap((item) => item.neighbors || item.links || []);
+  const discovered = (result.results || []).flatMap((item) => item.neighbors || item.links || []).map((neighbor) => annotateNeighborWithDiscoveredNode(neighbor, discoveredNodes));
   const matchedNeighbors = discovered.filter((neighbor) => neighbor.targetDeviceId);
   const unmatched = result.unmatchedNeighbors || discovered.filter((neighbor) => !neighbor.targetDeviceId);
+  const unmatchedNeighbors = unmatched.map((neighbor) => annotateNeighborWithDiscoveredNode(neighbor, discoveredNodes));
   const errors = result.errors || [];
   const scanned = summary.scanned ?? result.devices ?? 0;
   const matched = summary.matched ?? 0;
-  const unmatchedCount = summary.unmatched ?? unmatched.length;
+  const unmatchedCount = summary.unmatched ?? unmatchedNeighbors.length;
   const errorCount = summary.errors || errors.length;
   const emptyMessage = scanned === 0
     ? "No devices with SNMP credentials or SNMP sensors were found."
@@ -563,7 +571,7 @@ function TopologyDiscoveryResult({ result, devices = [], scanning = false, showT
       </div>
       {emptyMessage && <p className="lldp-empty-message">{emptyMessage}</p>}
       {!!matchedNeighbors.length && <LldpNeighborSection title="Matched Devices" status="matched" neighbors={matchedNeighbors} devices={devices} />}
-      {!!unmatched.length && <LldpNeighborSection title="Not In Devices" status="unmatched" neighbors={unmatched} devices={devices} />}
+      {!!unmatchedNeighbors.length && <LldpNeighborSection title="Not In Devices" status="unmatched" neighbors={unmatchedNeighbors} devices={devices} />}
       {!!errors.length && <LldpErrorSection errors={errors} devices={devices} />}
     </div>
   );
@@ -582,7 +590,7 @@ function LldpNeighborSection({ title, status, neighbors, devices }) {
             </div>
             <div className="lldp-neighbor-path">
               <span>via {neighbor.sourceDeviceName || deviceNameById(devices, neighbor.sourceDeviceId) || "Source"} <b>{topologyPortLabel(neighbor.localPort) || "-"}</b></span>
-              <span>{neighbor.targetDeviceId ? `to ${neighbor.targetDeviceName || deviceNameById(devices, neighbor.targetDeviceId) || "Target"}` : "remote port"} <b>{topologyPortLabel(neighbor.remotePort) || "-"}</b></span>
+              <span>{neighbor.targetDeviceId ? `to ${neighbor.targetDeviceName || deviceNameById(devices, neighbor.targetDeviceId) || "Target"}` : "remote port"} <b>{topologyPortLabel(neighbor.remotePortId || neighbor.remotePort) || "-"}</b></span>
             </div>
             <span className={`lldp-row-state ${status}`}>{status === "matched" ? "Matched" : "Not in devices"}</span>
           </article>
@@ -923,7 +931,7 @@ function PortThresholdRulesPanel({ sensor, threshold, loading, pending, actions 
   );
 }
 
-function ModalHost({ modal, actions, data }) {
+function ModalHost({ modal, actions, data, pending }) {
   if (!modal) return null;
   const device = modal.deviceId ? data.devices.find((item) => String(item.id) === String(modal.deviceId)) : null;
   if (modal.type === "device") return <DeviceModal modal={modal} actions={actions} />;
@@ -931,7 +939,7 @@ function ModalHost({ modal, actions, data }) {
   if (modal.type === "sensor") return <SensorModal device={device} actions={actions} />;
   if (modal.type === "traffic") return <TrafficModal device={device} sensors={data.sensors} actions={actions} />;
   if (modal.type === "internet-monitor") return <InternetMonitorModal actions={actions} ui={{ ModalShell, FormMessage, ModalActions }} />;
-  if (modal.type === "lldp-results") return <LldpDiscoveryModal modal={modal} devices={data.devices} actions={actions} />;
+  if (modal.type === "lldp-results") return <LldpDiscoveryModal modal={modal} devices={data.devices} discoveredNodes={data.discoveredNodes} actions={actions} pending={pending} />;
   return null;
 }
 
@@ -1257,6 +1265,37 @@ function Topology({ devices, links = [], actions }) {
   );
 }
 
+function DiscoveredNodesList({ nodes = [], devices = [] }) {
+  const visible = nodes.filter((node) => node.status === "unmanaged").slice(0, 12);
+  return (
+    <section className="discovered-list-panel">
+      <div className="discovered-list-head">
+        <div><strong>Discovered Not In Devices</strong><span>LLDP neighbors seen from managed devices but not added as monitored devices.</span></div>
+        <small>{visible.length}</small>
+      </div>
+      {visible.length ? (
+        <div className="discovered-list">
+          {visible.map((node) => (
+            <article className="discovered-row" key={node.id}>
+              <div className="discovered-main">
+                <strong>{node.hostname || node.managementIp || node.chassisId || "Unknown neighbor"}</strong>
+                <span>{[node.managementIp, node.chassisId].filter(Boolean).join(" / ") || "No management address"}</span>
+              </div>
+              <div className="discovered-path">
+                <span>via {node.sourceDeviceName || deviceNameById(devices, node.sourceDeviceId) || "Source"} <b>{topologyPortLabel(node.localPort) || "-"}</b></span>
+                <span>remote port <b>{topologyPortLabel(node.remotePortId || node.remotePort) || "-"}</b></span>
+              </div>
+              <span className="lldp-row-state unmatched">Not in devices</span>
+            </article>
+          ))}
+        </div>
+      ) : (
+        <p className="discovered-empty">No unmanaged LLDP neighbors recorded. Run Discover LLDP to refresh the list.</p>
+      )}
+    </section>
+  );
+}
+
 function PortMiniChart({ samples }) {
   const width = 120;
   const height = 36;
@@ -1535,10 +1574,11 @@ function buildLocalNetworkData(data) {
     return deviceIds.has(String(event.deviceId));
   });
   const topologyLinks = data.topologyLinks.filter((link) => deviceIds.has(String(link.sourceDeviceId)) && deviceIds.has(String(link.targetDeviceId)));
+  const discoveredNodes = (data.discoveredNodes || []).filter((node) => deviceIds.has(String(node.sourceDeviceId)));
   const summary = summarizeSensorStatuses(sensors);
   summary.devices = devices.length;
   summary.sensors = sensors.length;
-  return { ...data, devices, sensors, events, topologyLinks, summary };
+  return { ...data, devices, sensors, events, topologyLinks, discoveredNodes, summary };
 }
 
 function summarizeSensorStatuses(sensors) {
@@ -1771,15 +1811,33 @@ function topologyLinkScore(link) {
   return sourceScore + targetScore + targetIdBonus;
 }
 
+function topologyNormalizedPort(value) {
+  return (topologyPortLabel(value) || shortInterfaceName(value)).toLowerCase();
+}
+
+function topologyLinksAreReciprocal(a, b) {
+  if (String(a.sourceDeviceId) !== String(b.targetDeviceId) || String(a.targetDeviceId) !== String(b.sourceDeviceId)) return false;
+  const aLocal = topologyNormalizedPort(a.localPort);
+  const aRemote = topologyNormalizedPort(a.remotePortId || a.remotePort);
+  const bLocal = topologyNormalizedPort(b.localPort);
+  const bRemote = topologyNormalizedPort(b.remotePortId || b.remotePort);
+  return !!aLocal && !!aRemote && aLocal === bRemote && aRemote === bLocal;
+}
+
 function collapseTopologyLinks(links) {
-  const grouped = new Map();
+  const groups = new Map();
   for (const link of links) {
     if (!link.sourceDeviceId || !link.targetDeviceId) continue;
     const key = topologyPairKey(link);
-    const current = grouped.get(key);
-    if (!current || topologyLinkScore(link) > topologyLinkScore(current)) grouped.set(key, link);
+    groups.set(key, [...(groups.get(key) || []), link]);
   }
-  return Array.from(grouped.values());
+  return Array.from(groups.values()).map((group) => group.reduce((best, link) => {
+    const reciprocalBonus = group.some((candidate) => candidate !== link && topologyLinksAreReciprocal(link, candidate)) ? 20 : 0;
+    const score = topologyLinkScore(link) + reciprocalBonus;
+    const bestReciprocalBonus = group.some((candidate) => candidate !== best && topologyLinksAreReciprocal(best, candidate)) ? 20 : 0;
+    const bestScore = topologyLinkScore(best) + bestReciprocalBonus;
+    return score > bestScore ? link : best;
+  }, group[0]));
 }
 
 function topologyPortLabel(value) {
@@ -1799,6 +1857,18 @@ function topologyLabelPoint(source, target, ratio) {
     x: clampPercent(x + (-dy / length) * offset, 6, 94),
     y: clampPercent(y + (dx / length) * offset, 8, 92),
   };
+}
+
+function annotateNeighborWithDiscoveredNode(neighbor, discoveredNodes) {
+  const node = discoveredNodes.find((item) => {
+    if (neighbor.discoveredNodeId && String(item.id) === String(neighbor.discoveredNodeId)) return true;
+    if (neighbor.identityKey && item.identityKey === neighbor.identityKey) return true;
+    if (neighbor.remoteManagementIp && item.managementIp && String(item.managementIp).toLowerCase() === String(neighbor.remoteManagementIp).toLowerCase()) return true;
+    if (neighbor.remoteChassisId && item.chassisId && String(item.chassisId).toLowerCase() === String(neighbor.remoteChassisId).toLowerCase()) return true;
+    if (neighbor.remoteSystemName && item.hostname && String(item.hostname).toLowerCase() === String(neighbor.remoteSystemName).toLowerCase()) return true;
+    return false;
+  });
+  return node ? { ...neighbor, discoveredNode: node, discoveredNodeId: node.id, discoveredNodeStatus: node.status } : neighbor;
 }
 
 function deviceNameById(devices, id) {

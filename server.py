@@ -163,6 +163,26 @@ def init_db() -> None:
                 FOREIGN KEY(target_device_id) REFERENCES devices(id) ON DELETE SET NULL
             );
 
+            CREATE TABLE IF NOT EXISTS discovered_nodes (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                identity_key TEXT NOT NULL UNIQUE,
+                source_device_id INTEGER,
+                mapped_device_id INTEGER,
+                hostname TEXT NOT NULL DEFAULT '',
+                management_ip TEXT NOT NULL DEFAULT '',
+                chassis_id TEXT NOT NULL DEFAULT '',
+                local_port TEXT NOT NULL DEFAULT '',
+                remote_port TEXT NOT NULL DEFAULT '',
+                remote_port_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'unmanaged',
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(source_device_id) REFERENCES devices(id) ON DELETE SET NULL,
+                FOREIGN KEY(mapped_device_id) REFERENCES devices(id) ON DELETE SET NULL
+            );
+
             CREATE TABLE IF NOT EXISTS samples (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 sensor_id INTEGER NOT NULL,
@@ -267,6 +287,8 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_sample_rollups_bucket_start ON sample_rollups(bucket, bucket_start);
             CREATE INDEX IF NOT EXISTS idx_topology_links_source ON topology_links(source_device_id);
             CREATE INDEX IF NOT EXISTS idx_topology_links_target ON topology_links(target_device_id);
+            CREATE INDEX IF NOT EXISTS idx_discovered_nodes_status ON discovered_nodes(status);
+            CREATE INDEX IF NOT EXISTS idx_discovered_nodes_source ON discovered_nodes(source_device_id);
             """
         )
         ensure_column(connection, "devices", "topology_x", "REAL")
@@ -503,6 +525,28 @@ def row_to_topology_link(row: sqlite3.Row) -> dict:
         "remoteChassisId": row["remote_chassis_id"],
         "remotePortId": row["remote_port_id"],
         "status": row["status"],
+        "lastSeen": row["last_seen"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def row_to_discovered_node(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "identityKey": row["identity_key"],
+        "sourceDeviceId": row["source_device_id"],
+        "sourceDeviceName": row["source_device_name"] if "source_device_name" in row.keys() else "",
+        "mappedDeviceId": row["mapped_device_id"],
+        "mappedDeviceName": row["mapped_device_name"] if "mapped_device_name" in row.keys() else "",
+        "hostname": row["hostname"],
+        "managementIp": row["management_ip"],
+        "chassisId": row["chassis_id"],
+        "localPort": row["local_port"],
+        "remotePort": row["remote_port"],
+        "remotePortId": row["remote_port_id"],
+        "status": row["status"],
+        "firstSeen": row["first_seen"],
         "lastSeen": row["last_seen"],
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
@@ -1264,6 +1308,30 @@ def get_topology_links() -> list[dict]:
         return [row_to_topology_link(row) for row in rows]
 
 
+def get_discovered_nodes(filters: dict | None = None) -> list[dict]:
+    filters = filters or {}
+    status = str(filters.get("status") or "").strip()
+    where = []
+    params = []
+    if status and status != "all":
+        where.append("discovered_nodes.status = ?")
+        params.append(status)
+    sql = """
+        SELECT discovered_nodes.*,
+               source.name AS source_device_name,
+               mapped.name AS mapped_device_name
+        FROM discovered_nodes
+        LEFT JOIN devices source ON source.id = discovered_nodes.source_device_id
+        LEFT JOIN devices mapped ON mapped.id = discovered_nodes.mapped_device_id
+    """
+    if where:
+        sql += " WHERE " + " AND ".join(where)
+    sql += " ORDER BY discovered_nodes.status, discovered_nodes.last_seen DESC, discovered_nodes.hostname"
+    with DB_LOCK, db() as connection:
+        rows = connection.execute(sql, params).fetchall()
+        return [row_to_discovered_node(row) for row in rows]
+
+
 def sensor_filter_clause(filters: dict | None = None) -> tuple[str, list]:
     filters = filters or {}
     where = []
@@ -1612,6 +1680,130 @@ def get_summary() -> dict:
         if row["status"] in summary:
             summary[row["status"]] = row["count"]
     return summary
+
+
+def discovered_node_row(connection: sqlite3.Connection, node_id: int) -> sqlite3.Row:
+    row = connection.execute("SELECT * FROM discovered_nodes WHERE id = ?", (node_id,)).fetchone()
+    if not row:
+        raise ValueError("Discovered node not found.")
+    return row
+
+
+def get_discovered_node(node_id: int) -> dict:
+    with DB_LOCK, db() as connection:
+        rows = connection.execute(
+            """
+            SELECT discovered_nodes.*,
+                   source.name AS source_device_name,
+                   mapped.name AS mapped_device_name
+            FROM discovered_nodes
+            LEFT JOIN devices source ON source.id = discovered_nodes.source_device_id
+            LEFT JOIN devices mapped ON mapped.id = discovered_nodes.mapped_device_id
+            WHERE discovered_nodes.id = ?
+            """,
+            (node_id,),
+        ).fetchall()
+        if not rows:
+            raise ValueError("Discovered node not found.")
+        return row_to_discovered_node(rows[0])
+
+
+def remove_discovered_topology_link(connection: sqlite3.Connection, node: sqlite3.Row) -> None:
+    connection.execute(
+        """
+        DELETE FROM topology_links
+        WHERE protocol = 'lldp'
+          AND source_device_id = ?
+          AND local_port = ?
+          AND remote_system_name = ?
+          AND remote_chassis_id = ?
+        """,
+        (node["source_device_id"], node["local_port"], node["hostname"], node["chassis_id"]),
+    )
+
+
+def create_topology_link_from_discovered(connection: sqlite3.Connection, node: sqlite3.Row, target_device_id: int) -> None:
+    if not node["source_device_id"]:
+        raise ValueError("Discovered node has no source device.")
+    if int(node["source_device_id"]) == int(target_device_id):
+        raise ValueError("Cannot map a discovered node to its source device.")
+    target = connection.execute("SELECT id FROM devices WHERE id = ?", (target_device_id,)).fetchone()
+    if not target:
+        raise ValueError("Target device not found.")
+    timestamp = now_iso()
+    remove_discovered_topology_link(connection, node)
+    connection.execute(
+        """
+        INSERT INTO topology_links
+          (source_device_id, target_device_id, protocol, local_port, remote_port, remote_management_ip, remote_system_name,
+           remote_chassis_id, remote_port_id, status, last_seen, created_at, updated_at)
+        VALUES (?, ?, 'lldp', ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?)
+        """,
+        (
+            node["source_device_id"],
+            target_device_id,
+            node["local_port"],
+            node["remote_port"],
+            node["management_ip"],
+            node["hostname"],
+            node["chassis_id"],
+            node["remote_port_id"],
+            timestamp,
+            timestamp,
+            timestamp,
+        ),
+    )
+
+
+def set_discovered_node_status(node_id: int, status: str) -> dict:
+    if status not in {"unmanaged", "ignored"}:
+        raise ValueError("Unsupported discovered node status.")
+    timestamp = now_iso()
+    with DB_LOCK, db() as connection:
+        node = discovered_node_row(connection, node_id)
+        if status == "ignored":
+            remove_discovered_topology_link(connection, node)
+        connection.execute(
+            "UPDATE discovered_nodes SET status = ?, mapped_device_id = NULL, updated_at = ? WHERE id = ?",
+            (status, timestamp, node_id),
+        )
+    return get_discovered_node(node_id)
+
+
+def map_discovered_node(node_id: int, payload: dict) -> dict:
+    target_device_id = int(payload.get("deviceId") or payload.get("device_id") or 0)
+    if not target_device_id:
+        raise ValueError("deviceId is required.")
+    timestamp = now_iso()
+    with DB_LOCK, db() as connection:
+        node = discovered_node_row(connection, node_id)
+        create_topology_link_from_discovered(connection, node, target_device_id)
+        connection.execute(
+            "UPDATE discovered_nodes SET status = 'mapped', mapped_device_id = ?, updated_at = ? WHERE id = ?",
+            (target_device_id, timestamp, node_id),
+        )
+    return get_discovered_node(node_id)
+
+
+def promote_discovered_node(node_id: int, payload: dict) -> dict:
+    node = get_discovered_node(node_id)
+    name = str(payload.get("name") or node.get("hostname") or node.get("managementIp") or node.get("chassisId") or "Discovered Node").strip()
+    host = str(payload.get("host") or node.get("managementIp") or "").strip()
+    if not host:
+        raise ValueError("Host is required to promote this discovered node.")
+    device = create_device(
+        {
+            "name": name,
+            "host": host,
+            "group": str(payload.get("group") or "Discovered").strip() or "Discovered",
+            "tags": str(payload.get("tags") or "lldp,discovered").strip(),
+            "notes": str(payload.get("notes") or f"Promoted from LLDP discovered node {node_id}.").strip(),
+            "snmpCommunity": str(payload.get("snmpCommunity") or "").strip(),
+            "snmpPort": int(payload.get("snmpPort") or 161),
+        }
+    )
+    mapped = map_discovered_node(node_id, {"deviceId": device["id"]})
+    return {"ok": True, "device": device, "node": mapped}
 
 
 def create_device(payload: dict) -> dict:
@@ -2911,6 +3103,84 @@ def match_device_id(match_index: dict[str, int], *candidates) -> int | None:
     return None
 
 
+def discovered_identity_key(neighbor: dict) -> str:
+    management_ip = clean_snmp_text(neighbor.get("remoteManagementIp") or neighbor.get("managementIp"))
+    chassis_id = clean_snmp_text(neighbor.get("remoteChassisId") or neighbor.get("chassisId"))
+    hostname = clean_snmp_text(neighbor.get("remoteSystemName") or neighbor.get("hostname"))
+    source_device_id = clean_snmp_text(neighbor.get("sourceDeviceId"))
+    local_port = clean_snmp_text(neighbor.get("localPort"))
+    remote_port = clean_snmp_text(neighbor.get("remotePortId") or neighbor.get("remotePort"))
+    if management_ip:
+        return f"ip:{management_ip.lower()}"
+    if chassis_id:
+        return f"chassis:{re.sub(r'[^a-z0-9]', '', chassis_id.lower())}"
+    hostname_key = sorted(discovery_keys(hostname), key=lambda item: (len(item), item))[0] if discovery_keys(hostname) else ""
+    if hostname_key:
+        return f"host:{hostname_key}"
+    return f"link:{source_device_id}:{local_port.lower()}:{remote_port.lower()}"
+
+
+def discovered_nodes_by_identity(connection: sqlite3.Connection) -> dict[str, sqlite3.Row]:
+    rows = connection.execute("SELECT * FROM discovered_nodes").fetchall()
+    return {row["identity_key"]: row for row in rows}
+
+
+def upsert_discovered_node(connection: sqlite3.Connection, neighbor: dict, timestamp: str | None = None) -> sqlite3.Row:
+    timestamp = timestamp or now_iso()
+    identity_key = discovered_identity_key(neighbor)
+    existing = connection.execute("SELECT * FROM discovered_nodes WHERE identity_key = ?", (identity_key,)).fetchone()
+    status = existing["status"] if existing and existing["status"] in {"ignored", "mapped"} else "unmanaged"
+    mapped_device_id = existing["mapped_device_id"] if existing and existing["status"] == "mapped" else None
+    if existing:
+        connection.execute(
+            """
+            UPDATE discovered_nodes
+            SET source_device_id = ?, hostname = ?, management_ip = ?, chassis_id = ?,
+                local_port = ?, remote_port = ?, remote_port_id = ?, status = ?,
+                mapped_device_id = ?, last_seen = ?, updated_at = ?
+            WHERE identity_key = ?
+            """,
+            (
+                neighbor.get("sourceDeviceId"),
+                clean_snmp_text(neighbor.get("remoteSystemName")),
+                clean_snmp_text(neighbor.get("remoteManagementIp")),
+                clean_snmp_text(neighbor.get("remoteChassisId")),
+                clean_snmp_text(neighbor.get("localPort")),
+                clean_snmp_text(neighbor.get("remotePort")),
+                clean_snmp_text(neighbor.get("remotePortId")),
+                status,
+                mapped_device_id,
+                timestamp,
+                timestamp,
+                identity_key,
+            ),
+        )
+    else:
+        connection.execute(
+            """
+            INSERT INTO discovered_nodes
+              (identity_key, source_device_id, mapped_device_id, hostname, management_ip, chassis_id,
+               local_port, remote_port, remote_port_id, status, first_seen, last_seen, created_at, updated_at)
+            VALUES (?, ?, NULL, ?, ?, ?, ?, ?, ?, 'unmanaged', ?, ?, ?, ?)
+            """,
+            (
+                identity_key,
+                neighbor.get("sourceDeviceId"),
+                clean_snmp_text(neighbor.get("remoteSystemName")),
+                clean_snmp_text(neighbor.get("remoteManagementIp")),
+                clean_snmp_text(neighbor.get("remoteChassisId")),
+                clean_snmp_text(neighbor.get("localPort")),
+                clean_snmp_text(neighbor.get("remotePort")),
+                clean_snmp_text(neighbor.get("remotePortId")),
+                timestamp,
+                timestamp,
+                timestamp,
+                timestamp,
+            ),
+        )
+    return connection.execute("SELECT * FROM discovered_nodes WHERE identity_key = ?", (identity_key,)).fetchone()
+
+
 def snmp_sensor_profiles(connection: sqlite3.Connection, device_id: int) -> list[dict]:
     rows = connection.execute(
         "SELECT config_json FROM sensors WHERE device_id = ? AND type IN ('snmp', 'snmp_traffic') ORDER BY id ASC",
@@ -2960,6 +3230,7 @@ def discover_lldp_topology(device_id: int, payload: dict | None = None) -> dict:
         devices = connection.execute("SELECT * FROM devices").fetchall()
         profiles = snmp_sensor_profiles(connection, device_id) if device else []
         snmp_aliases = snmp_hostname_aliases(connection)
+        discovered_map = discovered_nodes_by_identity(connection)
     if not device:
         raise ValueError("Device not found.")
     if is_internet_system_device_row(device):
@@ -3003,8 +3274,21 @@ def discover_lldp_topology(device_id: int, payload: dict | None = None) -> dict:
         remote_port_id = clean_snmp_text(rem_port_ids.get(key))
         remote_port = clean_snmp_text(rem_port_desc.get(key)) or remote_port_id
         remote_management_ip = clean_snmp_text(rem_management.get(key))
-        local_port = clean_snmp_text(local_desc.get(local_port_number)) or clean_snmp_text(local_ids.get(local_port_number)) or local_port_number
+        local_port = clean_snmp_text(local_ids.get(local_port_number)) or clean_snmp_text(local_desc.get(local_port_number)) or local_port_number
         target_device_id = match_device_id(match_index, remote_management_ip, remote_system_name, remote_chassis_id)
+        discovery_probe = {
+            "sourceDeviceId": int(device_id),
+            "localPort": local_port,
+            "remotePort": remote_port,
+            "remotePortId": remote_port_id,
+            "remoteSystemName": remote_system_name,
+            "remoteManagementIp": remote_management_ip,
+            "remoteChassisId": remote_chassis_id,
+        }
+        discovered_identity = discovered_identity_key(discovery_probe)
+        discovered_existing = discovered_map.get(discovered_identity)
+        if not target_device_id and discovered_existing and discovered_existing["status"] == "mapped" and discovered_existing["mapped_device_id"]:
+            target_device_id = int(discovered_existing["mapped_device_id"])
         target_device = devices_by_id.get(int(target_device_id)) if target_device_id else None
         if not remote_system_name and not remote_chassis_id and not remote_port and not remote_management_ip:
             continue
@@ -3023,6 +3307,9 @@ def discover_lldp_topology(device_id: int, payload: dict | None = None) -> dict:
                 "remoteSystemName": remote_system_name,
                 "remoteChassisId": remote_chassis_id,
                 "remotePortId": remote_port_id,
+                "discoveredNodeId": discovered_existing["id"] if discovered_existing else None,
+                "discoveredNodeStatus": discovered_existing["status"] if discovered_existing else "",
+                "identityKey": discovered_identity,
                 "unmatchedReason": "" if target_device_id else "not_found_in_devices",
                 "status": "active",
                 "lastSeen": timestamp,
@@ -3032,29 +3319,34 @@ def discover_lldp_topology(device_id: int, payload: dict | None = None) -> dict:
     with DB_LOCK, db() as connection:
         connection.execute("DELETE FROM topology_links WHERE source_device_id = ? AND protocol = 'lldp'", (device_id,))
         for link in links:
-            connection.execute(
-                """
-                INSERT INTO topology_links
-                  (source_device_id, target_device_id, protocol, local_port, remote_port, remote_management_ip, remote_system_name,
-                   remote_chassis_id, remote_port_id, status, last_seen, created_at, updated_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
-                (
-                    link["sourceDeviceId"],
-                    link["targetDeviceId"],
-                    link["protocol"],
-                    link["localPort"],
-                    link["remotePort"],
-                    link["remoteManagementIp"],
-                    link["remoteSystemName"],
-                    link["remoteChassisId"],
-                    link["remotePortId"],
-                    link["status"],
-                    timestamp,
-                    timestamp,
-                    timestamp,
-                ),
-            )
+            if link.get("targetDeviceId"):
+                connection.execute(
+                    """
+                    INSERT INTO topology_links
+                      (source_device_id, target_device_id, protocol, local_port, remote_port, remote_management_ip, remote_system_name,
+                       remote_chassis_id, remote_port_id, status, last_seen, created_at, updated_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        link["sourceDeviceId"],
+                        link["targetDeviceId"],
+                        link["protocol"],
+                        link["localPort"],
+                        link["remotePort"],
+                        link["remoteManagementIp"],
+                        link["remoteSystemName"],
+                        link["remoteChassisId"],
+                        link["remotePortId"],
+                        link["status"],
+                        timestamp,
+                        timestamp,
+                        timestamp,
+                    ),
+                )
+            else:
+                discovered = upsert_discovered_node(connection, link, timestamp)
+                link["discoveredNodeId"] = discovered["id"]
+                link["discoveredNodeStatus"] = discovered["status"]
         rows = connection.execute("SELECT * FROM topology_links WHERE source_device_id = ? AND protocol = 'lldp'", (device_id,)).fetchall()
 
     persisted = [row_to_topology_link(row) for row in rows]
@@ -3201,6 +3493,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(get_groups())
             if path == "/api/topology/links":
                 return self.send_json(get_topology_links())
+            if path == "/api/discovered-nodes":
+                return self.send_json(get_discovered_nodes(query))
             if path == "/api/sensors":
                 if query_flag(query, "includeTotal"):
                     return self.send_json(get_sensors_page(query))
@@ -3259,6 +3553,18 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(create_group(payload), 201)
             if path == "/api/topology/discover":
                 return self.send_json(discover_all_lldp_topology(payload))
+            match = re.fullmatch(r"/api/discovered-nodes/(\d+)/ignore", path)
+            if match:
+                return self.send_json(set_discovered_node_status(int(match.group(1)), "ignored"))
+            match = re.fullmatch(r"/api/discovered-nodes/(\d+)/unignore", path)
+            if match:
+                return self.send_json(set_discovered_node_status(int(match.group(1)), "unmanaged"))
+            match = re.fullmatch(r"/api/discovered-nodes/(\d+)/map", path)
+            if match:
+                return self.send_json(map_discovered_node(int(match.group(1)), payload))
+            match = re.fullmatch(r"/api/discovered-nodes/(\d+)/promote", path)
+            if match:
+                return self.send_json(promote_discovered_node(int(match.group(1)), payload), 201)
             match = re.fullmatch(r"/api/devices/(\d+)/sensors", path)
             if match:
                 return self.send_json(create_sensor(int(match.group(1)), payload), 201)
