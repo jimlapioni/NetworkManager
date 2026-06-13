@@ -7,6 +7,7 @@ import re
 import base64
 import hashlib
 import hmac
+import ipaddress
 import socket
 import sqlite3
 import smtplib
@@ -49,6 +50,16 @@ IF_SPEED_OID = "1.3.6.1.2.1.2.2.1.5"
 IF_ALIAS_OID = "1.3.6.1.2.1.31.1.1.1.18"
 IF_HC_IN_OID = "1.3.6.1.2.1.31.1.1.1.6"
 IF_HC_OUT_OID = "1.3.6.1.2.1.31.1.1.1.10"
+LLDP_LOC_PORT_ID_OID = "1.0.8802.1.1.2.1.3.7.1.3"
+LLDP_LOC_PORT_DESC_OID = "1.0.8802.1.1.2.1.3.7.1.4"
+LLDP_REM_CHASSIS_ID_OID = "1.0.8802.1.1.2.1.4.1.1.5"
+LLDP_REM_PORT_ID_OID = "1.0.8802.1.1.2.1.4.1.1.7"
+LLDP_REM_PORT_DESC_OID = "1.0.8802.1.1.2.1.4.1.1.8"
+LLDP_REM_SYS_NAME_OID = "1.0.8802.1.1.2.1.4.1.1.9"
+LLDP_REM_MAN_ADDR_IF_ID_OID = "1.0.8802.1.1.2.1.4.2.1.4"
+INTERNET_DEVICE_NAME = "Internet"
+INTERNET_DEVICE_HOST = "internet.local"
+INTERNET_DEVICE_GROUP = "Internet"
 TRAFFIC_POLL_LOCK = threading.Lock()
 TRAFFIC_POLL_DEVICES: set[int] = set()
 
@@ -131,6 +142,25 @@ def init_db() -> None:
                 title TEXT NOT NULL,
                 message TEXT NOT NULL,
                 created_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS topology_links (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                source_device_id INTEGER NOT NULL,
+                target_device_id INTEGER,
+                protocol TEXT NOT NULL DEFAULT 'lldp',
+                local_port TEXT NOT NULL DEFAULT '',
+                remote_port TEXT NOT NULL DEFAULT '',
+                remote_management_ip TEXT NOT NULL DEFAULT '',
+                remote_system_name TEXT NOT NULL DEFAULT '',
+                remote_chassis_id TEXT NOT NULL DEFAULT '',
+                remote_port_id TEXT NOT NULL DEFAULT '',
+                status TEXT NOT NULL DEFAULT 'active',
+                last_seen TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                FOREIGN KEY(source_device_id) REFERENCES devices(id) ON DELETE CASCADE,
+                FOREIGN KEY(target_device_id) REFERENCES devices(id) ON DELETE SET NULL
             );
 
             CREATE TABLE IF NOT EXISTS samples (
@@ -235,11 +265,14 @@ def init_db() -> None:
             CREATE INDEX IF NOT EXISTS idx_samples_created ON samples(created_at);
             CREATE INDEX IF NOT EXISTS idx_sample_rollups_sensor_bucket_start ON sample_rollups(sensor_id, bucket, bucket_start);
             CREATE INDEX IF NOT EXISTS idx_sample_rollups_bucket_start ON sample_rollups(bucket, bucket_start);
+            CREATE INDEX IF NOT EXISTS idx_topology_links_source ON topology_links(source_device_id);
+            CREATE INDEX IF NOT EXISTS idx_topology_links_target ON topology_links(target_device_id);
             """
         )
         ensure_column(connection, "devices", "topology_x", "REAL")
         ensure_column(connection, "devices", "topology_y", "REAL")
         ensure_column(connection, "samples", "meta_json", "TEXT NOT NULL DEFAULT '{}'")
+        ensure_column(connection, "topology_links", "remote_management_ip", "TEXT NOT NULL DEFAULT ''")
         sync_groups_from_devices(connection)
         bootstrap_admin_from_env(connection)
 
@@ -436,12 +469,41 @@ def row_to_device(row: sqlite3.Row) -> dict:
         "group": row["group_name"],
         "tags": [tag.strip() for tag in row["tags"].split(",") if tag.strip()],
         "notes": row["notes"],
-        "snmpEnabled": bool(row["snmp_enabled"]),
         "snmpCommunity": row["snmp_community"],
         "snmpPort": row["snmp_port"],
         "status": row["status"],
         "topologyX": row["topology_x"],
         "topologyY": row["topology_y"],
+        "createdAt": row["created_at"],
+        "updatedAt": row["updated_at"],
+    }
+
+
+def is_internet_system_device_row(row) -> bool:
+    name = clean_snmp_text(row["name"] if isinstance(row, sqlite3.Row) else row.get("name")).lower()
+    host = clean_snmp_text(row["host"] if isinstance(row, sqlite3.Row) else row.get("host")).lower()
+    group = clean_snmp_text(row["group_name"] if isinstance(row, sqlite3.Row) else row.get("group_name", row.get("group", ""))).lower()
+    tags = clean_snmp_text(row["tags"] if isinstance(row, sqlite3.Row) else row.get("tags", "")).lower()
+    return (
+        name == INTERNET_DEVICE_NAME.lower()
+        and (host == INTERNET_DEVICE_HOST.lower() or group == INTERNET_DEVICE_GROUP.lower() or "system" in tags.split(","))
+    )
+
+
+def row_to_topology_link(row: sqlite3.Row) -> dict:
+    return {
+        "id": row["id"],
+        "sourceDeviceId": row["source_device_id"],
+        "targetDeviceId": row["target_device_id"],
+        "protocol": row["protocol"],
+        "localPort": row["local_port"],
+        "remotePort": row["remote_port"],
+        "remoteManagementIp": row["remote_management_ip"],
+        "remoteSystemName": row["remote_system_name"],
+        "remoteChassisId": row["remote_chassis_id"],
+        "remotePortId": row["remote_port_id"],
+        "status": row["status"],
+        "lastSeen": row["last_seen"],
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
     }
@@ -1191,6 +1253,17 @@ def get_devices(filters: dict | None = None) -> list[dict]:
         return [row_to_device(row) for row in rows]
 
 
+def get_topology_links() -> list[dict]:
+    with DB_LOCK, db() as connection:
+        rows = connection.execute(
+            """
+            SELECT * FROM topology_links
+            ORDER BY protocol, source_device_id, local_port, remote_system_name
+            """
+        ).fetchall()
+        return [row_to_topology_link(row) for row in rows]
+
+
 def sensor_filter_clause(filters: dict | None = None) -> tuple[str, list]:
     filters = filters or {}
     where = []
@@ -1557,8 +1630,8 @@ def create_device(payload: dict) -> dict:
         cursor = connection.execute(
             """
             INSERT INTO devices
-              (name, host, group_name, tags, notes, snmp_enabled, snmp_community, snmp_port, status, created_at, updated_at)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?)
+              (name, host, group_name, tags, notes, snmp_community, snmp_port, status, created_at, updated_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, 'unknown', ?, ?)
             """,
             (
                 name,
@@ -1566,7 +1639,6 @@ def create_device(payload: dict) -> dict:
                 group_name,
                 str(payload.get("tags") or "").strip(),
                 str(payload.get("notes") or "").strip(),
-                1 if payload.get("snmpEnabled") else 0,
                 str(payload.get("snmpCommunity") or "").strip(),
                 int(payload.get("snmpPort") or 161),
                 created_at,
@@ -1853,7 +1925,7 @@ def update_device(device_id: int, payload: dict) -> dict:
             """
             UPDATE devices
             SET name = ?, host = ?, group_name = ?, tags = ?, notes = ?,
-                snmp_enabled = ?, snmp_community = ?, snmp_port = ?, updated_at = ?
+                snmp_community = ?, snmp_port = ?, updated_at = ?
             WHERE id = ?
             """,
             (
@@ -1862,7 +1934,6 @@ def update_device(device_id: int, payload: dict) -> dict:
                 group_name,
                 str(payload.get("tags", row["tags"]) or "").strip(),
                 str(payload.get("notes", row["notes"]) or "").strip(),
-                1 if payload.get("snmpEnabled", bool(row["snmp_enabled"])) else 0,
                 str(payload.get("snmpCommunity", row["snmp_community"]) or "").strip(),
                 int(payload.get("snmpPort", row["snmp_port"]) or 161),
                 updated_at,
@@ -1944,6 +2015,7 @@ def delete_device(device_id: int) -> dict:
         for sensor_id in sensor_ids:
             connection.execute("DELETE FROM samples WHERE sensor_id = ?", (sensor_id,))
             connection.execute("DELETE FROM sample_rollups WHERE sensor_id = ?", (sensor_id,))
+        connection.execute("DELETE FROM topology_links WHERE source_device_id = ? OR target_device_id = ?", (device_id, device_id))
         connection.execute("DELETE FROM events WHERE device_id = ?", (device_id,))
         connection.execute("DELETE FROM sensors WHERE device_id = ?", (device_id,))
         connection.execute("DELETE FROM devices WHERE id = ?", (device_id,))
@@ -1959,6 +2031,7 @@ def delete_group(group_name: str) -> dict:
             for sensor_row in sensor_rows:
                 connection.execute("DELETE FROM samples WHERE sensor_id = ?", (sensor_row["id"],))
                 connection.execute("DELETE FROM sample_rollups WHERE sensor_id = ?", (sensor_row["id"],))
+            connection.execute("DELETE FROM topology_links WHERE source_device_id = ? OR target_device_id = ?", (device_id, device_id))
             connection.execute("DELETE FROM events WHERE device_id = ?", (device_id,))
             connection.execute("DELETE FROM sensors WHERE device_id = ?", (device_id,))
             connection.execute("DELETE FROM devices WHERE id = ?", (device_id,))
@@ -2709,6 +2782,329 @@ def discover_snmp_walk(device_id: int, payload: dict) -> dict:
     return {"ok": True, "baseOid": base_oid, "count": len(items), "items": items}
 
 
+def lldp_table(host: str, community: str, port: int, oid: str, limit: int) -> dict[str, str]:
+    rows = snmp_walk(host, community, port, oid, limit)
+    return {str(item.get("index") or "").strip(): clean_snmp_text(item.get("value")) for item in rows if str(item.get("index") or "").strip()}
+
+
+def lldp_remote_key(index: str) -> str:
+    parts = [part for part in str(index or "").split(".") if part]
+    return ".".join(parts[:3]) if len(parts) >= 3 else ""
+
+
+def lldp_management_address_from_index(index: str) -> tuple[str, str]:
+    try:
+        parts = [int(part) for part in str(index or "").split(".") if part != ""]
+    except ValueError:
+        return "", ""
+    if len(parts) < 5:
+        return "", ""
+    remote_key = ".".join(str(part) for part in parts[:3])
+    subtype = parts[3]
+    remainder = parts[4:]
+    candidates = []
+    if remainder and 0 < remainder[0] <= len(remainder) - 1:
+        candidates.append(remainder[1 : 1 + remainder[0]])
+    candidates.append(remainder)
+    for octets in candidates:
+        try:
+            if subtype == 1 and len(octets) >= 4:
+                return remote_key, ".".join(str(part) for part in octets[:4])
+            if subtype == 2 and len(octets) >= 16:
+                return remote_key, str(ipaddress.IPv6Address(bytes(octets[:16])))
+        except ValueError:
+            continue
+    return remote_key, ""
+
+
+def lldp_management_addresses(host: str, community: str, port: int, limit: int) -> dict[str, str]:
+    rows = snmp_walk(host, community, port, LLDP_REM_MAN_ADDR_IF_ID_OID, limit)
+    addresses = {}
+    for item in rows:
+        remote_key, address = lldp_management_address_from_index(str(item.get("index") or ""))
+        if remote_key and address and remote_key not in addresses:
+            addresses[remote_key] = address
+    return addresses
+
+
+def lldp_local_port_index(remote_index: str) -> str:
+    parts = [part for part in str(remote_index or "").split(".") if part]
+    return parts[-2] if len(parts) >= 3 else ""
+
+
+def discovery_keys(value) -> set[str]:
+    text = clean_snmp_text(value).lower()
+    if not text:
+        return set()
+    keys = {text}
+    hostname = text.rstrip(".")
+    is_ip_address = False
+    try:
+        ipaddress.ip_address(hostname)
+        is_ip_address = True
+    except ValueError:
+        is_ip_address = False
+    if hostname and hostname != text:
+        keys.add(hostname)
+    if "." in hostname and not is_ip_address:
+        short_hostname = hostname.split(".", 1)[0]
+        if short_hostname:
+            keys.add(short_hostname)
+    compact = re.sub(r"[^a-z0-9]", "", text)
+    if compact:
+        keys.add(compact)
+    return keys
+
+
+def snmp_hostname_aliases(connection: sqlite3.Connection) -> dict[int, list[str]]:
+    rows = connection.execute(
+        """
+        SELECT device_id, name, last_value, config_json
+        FROM sensors
+        WHERE type = 'snmp'
+        """
+    ).fetchall()
+    aliases: dict[int, list[str]] = {}
+    for row in rows:
+        try:
+            config = json.loads(row["config_json"] or "{}")
+        except json.JSONDecodeError:
+            config = {}
+        oid = clean_snmp_text(config.get("oid")).lower()
+        name = clean_snmp_text(row["name"]).lower()
+        value = clean_snmp_text(row["last_value"])
+        if not value or value in {"-", "None"}:
+            continue
+        is_hostname_sensor = (
+            oid == "1.3.6.1.2.1.1.5.0"
+            or "sysname" in name
+            or "system name" in name
+            or "hostname" in name
+        )
+        if is_hostname_sensor:
+            aliases.setdefault(int(row["device_id"]), []).append(value)
+    return aliases
+
+
+def device_match_index(rows: list[sqlite3.Row], source_device_id: int, snmp_aliases: dict[int, list[str]] | None = None) -> dict[str, int]:
+    index = {}
+    snmp_aliases = snmp_aliases or {}
+    for row in rows:
+        if int(row["id"]) == int(source_device_id) or is_internet_system_device_row(row):
+            continue
+        aliases = [row["name"], row["host"]]
+        aliases.extend([tag.strip() for tag in str(row["tags"] or "").split(",") if tag.strip()])
+        aliases.extend(snmp_aliases.get(int(row["id"]), []))
+        if row["notes"]:
+            aliases.append(row["notes"])
+        for value in aliases:
+            for key in discovery_keys(value):
+                index[key] = int(row["id"])
+    return index
+
+
+def match_device_id(match_index: dict[str, int], *candidates) -> int | None:
+    for candidate in candidates:
+        for key in discovery_keys(candidate):
+            if key in match_index:
+                return match_index[key]
+    return None
+
+
+def snmp_sensor_profiles(connection: sqlite3.Connection, device_id: int) -> list[dict]:
+    rows = connection.execute(
+        "SELECT config_json FROM sensors WHERE device_id = ? AND type IN ('snmp', 'snmp_traffic') ORDER BY id ASC",
+        (device_id,),
+    ).fetchall()
+    profiles = []
+    for row in rows:
+        try:
+            config = json.loads(row["config_json"] or "{}")
+        except json.JSONDecodeError:
+            continue
+        profiles.append(config)
+    return profiles
+
+
+def lldp_discovery_credentials(device: sqlite3.Row, profiles: list[dict], payload: dict) -> tuple[str, int]:
+    profile_with_community = next((profile for profile in profiles if clean_snmp_text(profile.get("community"))), {})
+    profile_with_port = next((profile for profile in profiles if profile.get("port")), {})
+    community = clean_snmp_text(payload.get("community") or device["snmp_community"] or profile_with_community.get("community") or "public")
+    port = int(payload.get("port") or device["snmp_port"] or profile_with_port.get("port") or 161)
+    return community, port
+
+
+def lldp_discovery_candidates(connection: sqlite3.Connection, payload: dict | None = None) -> list[sqlite3.Row]:
+    payload = payload or {}
+    rows = connection.execute("SELECT * FROM devices ORDER BY name").fetchall()
+    sensor_rows = connection.execute(
+        "SELECT DISTINCT device_id FROM sensors WHERE type IN ('snmp', 'snmp_traffic')"
+    ).fetchall()
+    devices_with_snmp_sensors = {int(row["device_id"]) for row in sensor_rows}
+    candidates = []
+    payload_has_profile = bool(clean_snmp_text(payload.get("community")) or payload.get("port"))
+    for row in rows:
+        if is_internet_system_device_row(row):
+            continue
+        has_device_profile = bool(clean_snmp_text(row["snmp_community"]) or int(row["snmp_port"] or 161) != 161)
+        has_snmp_sensor = int(row["id"]) in devices_with_snmp_sensors
+        if payload_has_profile or has_device_profile or has_snmp_sensor:
+            candidates.append(row)
+    return candidates
+
+
+def discover_lldp_topology(device_id: int, payload: dict | None = None) -> dict:
+    payload = payload or {}
+    with DB_LOCK, db() as connection:
+        device = connection.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
+        devices = connection.execute("SELECT * FROM devices").fetchall()
+        profiles = snmp_sensor_profiles(connection, device_id) if device else []
+        snmp_aliases = snmp_hostname_aliases(connection)
+    if not device:
+        raise ValueError("Device not found.")
+    if is_internet_system_device_row(device):
+        return {
+            "ok": True,
+            "deviceId": int(device_id),
+            "sourceDeviceName": device["name"],
+            "count": 0,
+            "matched": 0,
+            "unmatched": 0,
+            "neighbors": [],
+            "unmatchedNeighbors": [],
+            "links": [],
+            "skipped": True,
+        }
+
+    community, port = lldp_discovery_credentials(device, profiles, payload)
+    limit = int(payload.get("limit") or SNMP_TABLE_WALK_LIMIT)
+    host = device["host"]
+
+    local_ids = lldp_table(host, community, port, LLDP_LOC_PORT_ID_OID, limit)
+    local_desc = lldp_table(host, community, port, LLDP_LOC_PORT_DESC_OID, limit)
+    rem_chassis = lldp_table(host, community, port, LLDP_REM_CHASSIS_ID_OID, limit)
+    rem_port_ids = lldp_table(host, community, port, LLDP_REM_PORT_ID_OID, limit)
+    rem_port_desc = lldp_table(host, community, port, LLDP_REM_PORT_DESC_OID, limit)
+    rem_names = lldp_table(host, community, port, LLDP_REM_SYS_NAME_OID, limit)
+    try:
+        rem_management = lldp_management_addresses(host, community, port, limit)
+    except Exception:
+        rem_management = {}
+
+    match_index = device_match_index(devices, device_id, snmp_aliases)
+    devices_by_id = {int(row["id"]): row for row in devices}
+    keys = sorted(set(rem_chassis) | set(rem_port_ids) | set(rem_port_desc) | set(rem_names) | set(rem_management))
+    timestamp = now_iso()
+    links = []
+    for key in keys:
+        local_port_number = lldp_local_port_index(key)
+        remote_system_name = clean_snmp_text(rem_names.get(key))
+        remote_chassis_id = clean_snmp_text(rem_chassis.get(key))
+        remote_port_id = clean_snmp_text(rem_port_ids.get(key))
+        remote_port = clean_snmp_text(rem_port_desc.get(key)) or remote_port_id
+        remote_management_ip = clean_snmp_text(rem_management.get(key))
+        local_port = clean_snmp_text(local_desc.get(local_port_number)) or clean_snmp_text(local_ids.get(local_port_number)) or local_port_number
+        target_device_id = match_device_id(match_index, remote_management_ip, remote_system_name, remote_chassis_id)
+        target_device = devices_by_id.get(int(target_device_id)) if target_device_id else None
+        if not remote_system_name and not remote_chassis_id and not remote_port and not remote_management_ip:
+            continue
+        links.append(
+            {
+                "sourceDeviceId": int(device_id),
+                "sourceDeviceName": device["name"],
+                "sourceHost": device["host"],
+                "targetDeviceId": target_device_id,
+                "targetDeviceName": target_device["name"] if target_device else "",
+                "targetHost": target_device["host"] if target_device else "",
+                "protocol": "lldp",
+                "localPort": local_port,
+                "remotePort": remote_port,
+                "remoteManagementIp": remote_management_ip,
+                "remoteSystemName": remote_system_name,
+                "remoteChassisId": remote_chassis_id,
+                "remotePortId": remote_port_id,
+                "unmatchedReason": "" if target_device_id else "not_found_in_devices",
+                "status": "active",
+                "lastSeen": timestamp,
+            }
+        )
+
+    with DB_LOCK, db() as connection:
+        connection.execute("DELETE FROM topology_links WHERE source_device_id = ? AND protocol = 'lldp'", (device_id,))
+        for link in links:
+            connection.execute(
+                """
+                INSERT INTO topology_links
+                  (source_device_id, target_device_id, protocol, local_port, remote_port, remote_management_ip, remote_system_name,
+                   remote_chassis_id, remote_port_id, status, last_seen, created_at, updated_at)
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    link["sourceDeviceId"],
+                    link["targetDeviceId"],
+                    link["protocol"],
+                    link["localPort"],
+                    link["remotePort"],
+                    link["remoteManagementIp"],
+                    link["remoteSystemName"],
+                    link["remoteChassisId"],
+                    link["remotePortId"],
+                    link["status"],
+                    timestamp,
+                    timestamp,
+                    timestamp,
+                ),
+            )
+        rows = connection.execute("SELECT * FROM topology_links WHERE source_device_id = ? AND protocol = 'lldp'", (device_id,)).fetchall()
+
+    persisted = [row_to_topology_link(row) for row in rows]
+    unmatched_neighbors = [link for link in links if not link.get("targetDeviceId")]
+    return {
+        "ok": True,
+        "deviceId": int(device_id),
+        "sourceDeviceName": device["name"],
+        "count": len(persisted),
+        "matched": len([link for link in persisted if link.get("targetDeviceId")]),
+        "unmatched": len([link for link in persisted if not link.get("targetDeviceId")]),
+        "neighbors": links,
+        "unmatchedNeighbors": unmatched_neighbors,
+        "links": persisted,
+    }
+
+
+def discover_all_lldp_topology(payload: dict | None = None) -> dict:
+    payload = payload or {}
+    with DB_LOCK, db() as connection:
+        rows = lldp_discovery_candidates(connection, payload)
+    results = []
+    errors = []
+    for row in rows:
+        try:
+            results.append(discover_lldp_topology(int(row["id"]), payload))
+        except Exception as exc:
+            errors.append({"deviceId": int(row["id"]), "error": str(exc)})
+    unmatched_neighbors = []
+    for result in results:
+        unmatched_neighbors.extend(result.get("unmatchedNeighbors") or [])
+    matched = sum(int(result.get("matched") or 0) for result in results)
+    unmatched = len(unmatched_neighbors)
+    scanned = len(rows)
+    return {
+        "ok": not errors,
+        "devices": scanned,
+        "results": results,
+        "errors": errors,
+        "unmatchedNeighbors": unmatched_neighbors,
+        "summary": {
+            "scanned": scanned,
+            "matched": matched,
+            "unmatched": unmatched,
+            "errors": len(errors),
+        },
+        "links": get_topology_links(),
+    }
+
+
 def discover_interface_traffic(device_id: int, payload: dict) -> dict:
     with DB_LOCK, db() as connection:
         device = connection.execute("SELECT * FROM devices WHERE id = ?", (device_id,)).fetchone()
@@ -2803,6 +3199,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(get_devices(query))
             if path == "/api/groups":
                 return self.send_json(get_groups())
+            if path == "/api/topology/links":
+                return self.send_json(get_topology_links())
             if path == "/api/sensors":
                 if query_flag(query, "includeTotal"):
                     return self.send_json(get_sensors_page(query))
@@ -2859,6 +3257,8 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(create_device(payload), 201)
             if path == "/api/groups":
                 return self.send_json(create_group(payload), 201)
+            if path == "/api/topology/discover":
+                return self.send_json(discover_all_lldp_topology(payload))
             match = re.fullmatch(r"/api/devices/(\d+)/sensors", path)
             if match:
                 return self.send_json(create_sensor(int(match.group(1)), payload), 201)
@@ -2874,6 +3274,9 @@ class Handler(SimpleHTTPRequestHandler):
             match = re.fullmatch(r"/api/devices/(\d+)/interfaces/discover", path)
             if match:
                 return self.send_json(discover_interface_traffic(int(match.group(1)), payload))
+            match = re.fullmatch(r"/api/devices/(\d+)/topology/discover", path)
+            if match:
+                return self.send_json(discover_lldp_topology(int(match.group(1)), payload))
             match = re.fullmatch(r"/api/devices/(\d+)/topology", path)
             if match:
                 return self.send_json(update_device_topology(int(match.group(1)), payload))

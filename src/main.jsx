@@ -47,7 +47,7 @@ function icon(name) {
 
 function App() {
   const [route, setRouteState] = useState(() => parseRouteHash());
-  const [data, setData] = useState({ loading: true, apiOnline: false, summary: emptySummary, devices: [], groups: [], sensors: [], events: [] });
+  const [data, setData] = useState({ loading: true, apiOnline: false, summary: emptySummary, devices: [], groups: [], sensors: [], events: [], topologyLinks: [] });
   const [auth, setAuth] = useState({ loading: true, authenticated: false, setupRequired: false, authDisabled: false, user: null, error: "" });
   const [modal, setModal] = useState(null);
   const [deviceDetailTabs, setDeviceDetailTabs] = useState({});
@@ -59,6 +59,7 @@ function App() {
   const [sensorThresholdsLoading, setSensorThresholdsLoading] = useState({});
   const [pending, setPending] = useState(null);
   const [toast, setToast] = useState("");
+  const [topologyDiscovery, setTopologyDiscovery] = useState(null);
 
   const loadAuth = useCallback(async () => {
     try {
@@ -81,12 +82,13 @@ function App() {
   const loadData = useCallback(async ({ showLoading = false } = {}) => {
     if (showLoading) setData((current) => ({ ...current, loading: true }));
     try {
-      const [summary, devices, groups, sensors, events] = await Promise.all([
+      const [summary, devices, groups, sensors, events, topologyLinks] = await Promise.all([
         apiRequest("/api/summary"),
         apiRequest("/api/devices"),
         apiRequest("/api/groups"),
         apiRequest("/api/sensors"),
         apiRequest("/api/events"),
+        apiRequest("/api/topology/links"),
       ]);
       setData({
         loading: false,
@@ -96,6 +98,7 @@ function App() {
         groups: normalizeList(groups),
         sensors: normalizeList(sensors),
         events: normalizeList(events),
+        topologyLinks: normalizeList(topologyLinks),
       });
     } catch (error) {
       setData((current) => ({ ...current, loading: false, apiOnline: false }));
@@ -136,8 +139,11 @@ function App() {
   const selectedDeviceSensors = selectedDevice ? data.sensors.filter((sensor) => String(sensor.deviceId) === String(selectedDevice.id)) : [];
   const selectedPortSensors = selectedDeviceSensors.filter((sensor) => sensor.type === "snmp_traffic");
   const activeDeviceTab = deviceDetailTabs[String(selectedDevice?.id || "")] || (selectedPortSensors.length ? "ports" : "sensors");
+  const localNetworkData = useMemo(() => buildLocalNetworkData(data), [data]);
   const headerSummary = route.view === "internet"
     ? summarizeSensorStatuses(data.sensors.filter((sensor) => sensor.type === "http"))
+    : route.view === "dashboard"
+      ? localNetworkData.summary
     : data.summary;
 
   const refreshPortSamples = useCallback(async (deviceId, { force = false } = {}) => {
@@ -233,7 +239,8 @@ function App() {
       }
       window.localStorage.removeItem(authTokenStorageKey);
       setAuth({ loading: false, authenticated: false, setupRequired: false, authDisabled: false, user: null, error: "" });
-      setData((current) => ({ ...current, apiOnline: false, devices: [], groups: [], sensors: [], events: [], summary: emptySummary }));
+      setData((current) => ({ ...current, apiOnline: false, devices: [], groups: [], sensors: [], events: [], topologyLinks: [], summary: emptySummary }));
+      setTopologyDiscovery(null);
     },
     setRoute,
     setDeviceDetailTab: (deviceId, tab) => setDeviceDetailTabs((current) => ({ ...current, [deviceId]: tab })),
@@ -279,6 +286,9 @@ function App() {
     checkAllSensors: () => runAction("check-all", async () => {
       for (const sensor of data.sensors) await apiRequest(`/api/sensors/${sensor.id}/check-now`, { method: "POST" });
     }),
+    checkSensors: (sensors, label = "check-selected") => runAction(label, async () => {
+      for (const sensor of sensors || []) await apiRequest(`/api/sensors/${sensor.id}/check-now`, { method: "POST" });
+    }),
     deleteSensor: (sensor) => runAction(`delete-sensor-${sensor.id}`, async () => {
       if (!window.confirm(`Delete ${sensor.name || "this sensor"}? This removes its samples and alert events.`)) return null;
       return apiRequest(`/api/sensors/${sensor.id}`, { method: "DELETE" });
@@ -294,6 +304,20 @@ function App() {
       return apiRequest(`/api/groups/${encodeURIComponent(group.name)}`, { method: "DELETE" });
     }),
     saveTopology: (deviceId, payload) => apiRequest(`/api/devices/${deviceId}/topology`, { method: "POST", body: payload }).then(() => loadData({ showLoading: false })),
+    discoverTopology: () => runAction("discover-topology", async () => {
+      setModal({ type: "lldp-results", scanning: true });
+      try {
+        const result = await apiRequest("/api/topology/discover", { method: "POST", body: {} });
+        setTopologyDiscovery(result);
+        setModal({ type: "lldp-results", result });
+        return result;
+      } catch (error) {
+        const result = { ok: false, devices: 0, results: [], unmatchedNeighbors: [], errors: [{ error: error.message }], summary: { scanned: 0, matched: 0, unmatched: 0, errors: 1 } };
+        setTopologyDiscovery(result);
+        setModal({ type: "lldp-results", result });
+        throw error;
+      }
+    }),
     saveThreshold: (sensorId, payload) => runAction(`threshold-${sensorId}`, async () => {
       const threshold = await apiRequest(`/api/sensors/${sensorId}/thresholds`, { method: "PUT", body: payload });
       setSensorThresholds((current) => ({ ...current, [sensorId]: threshold }));
@@ -323,6 +347,8 @@ function App() {
       sensorThresholdsLoading={sensorThresholdsLoading}
       actions={actions}
       pending={pending}
+      localNetworkData={localNetworkData}
+      topologyDiscovery={topologyDiscovery}
     />
   );
 
@@ -355,7 +381,7 @@ function CurrentView(props) {
     const key = String(props.route.sensorId || "");
     return <SensorDetail sensor={props.selectedSensor} samples={props.sensorSamples[key] || []} sampleRange={props.sensorSampleRanges?.[key] || "1h"} loading={!!props.sensorSamplesLoading[key]} threshold={props.sensorThresholds?.[key]} thresholdLoading={!!props.sensorThresholdsLoading?.[key]} actions={props.actions} pending={props.pending} />;
   }
-  return <Dashboard {...props} />;
+  return <Dashboard {...props} data={props.localNetworkData || props.data} />;
 }
 
 function AuthScreen({ auth, setAuth, loadData }) {
@@ -460,27 +486,125 @@ function NavButton({ active, label, iconName, onClick }) {
   return <button className={active ? "active" : ""} type="button" onClick={onClick}>{icon(iconName)}<span>{label}</span></button>;
 }
 
-function Dashboard({ data, actions, pending }) {
+function Dashboard({ data, actions, pending, topologyDiscovery }) {
   return (
     <main className="dashboard">
       <section className="metrics-row">
         {metricCard("Devices", data.summary.devices, "Managed targets", "cyan")}
-        {metricCard("Sensors", data.summary.sensors, "Ping / HTTP / SNMP", "blue")}
+        {metricCard("Sensors", data.summary.sensors, "Ping / SNMP", "blue")}
         {metricCard("Alerts", (data.summary.warning || 0) + (data.summary.down || 0), "Warning / critical", "amber")}
         {metricCard("Probe", data.apiOnline ? "Online" : "Waiting", "Backend status", data.apiOnline ? "green" : "gray")}
       </section>
       <section className="command-grid">
         <div className="panel topology-panel">
-          <div className="panel-head"><div><h2>Network Topology</h2><p>Device positions and relationships.</p></div><button className="ghost-button" type="button" onClick={actions.refresh}>{icon("refresh")} Sync</button></div>
-          <Topology devices={data.devices} actions={actions} />
+          <div className="panel-head">
+            <div><h2>Network Topology</h2><p>Device positions and LLDP relationships.</p></div>
+            <div className="panel-head-actions">
+              <button className="ghost-button" type="button" disabled={pending === "discover-topology"} onClick={actions.discoverTopology}>{icon("radar")} {pending === "discover-topology" ? "Scanning LLDP..." : "Discover LLDP"}</button>
+              <button className="ghost-button" type="button" onClick={actions.refresh}>{icon("refresh")} Sync</button>
+            </div>
+          </div>
+          <Topology devices={data.devices} links={data.topologyLinks} actions={actions} />
         </div>
         <div className="panel alert-panel"><div className="panel-head"><div><h2>Alert Timeline</h2><p>Recent status transitions</p></div></div><EventsList events={data.events.slice(0, 8)} /></div>
         <div className="panel table-panel">
-          <div className="panel-head"><div><h2>Sensor Console</h2><p>Current readings from all monitors</p></div><button className="ghost-button" type="button" disabled={pending === "check-all"} onClick={actions.checkAllSensors}>{icon("play")} Check All</button></div>
+          <div className="panel-head"><div><h2>Sensor Console</h2><p>Current readings from local network monitors</p></div><button className="ghost-button" type="button" disabled={pending === "check-dashboard"} onClick={() => actions.checkSensors(data.sensors, "check-dashboard")}>{icon("play")} Check All</button></div>
           <SensorTable sensors={data.sensors} devices={data.devices} actions={actions} />
         </div>
       </section>
     </main>
+  );
+}
+
+function LldpDiscoveryModal({ modal, devices, actions }) {
+  const result = modal?.result || null;
+  const scanning = !!modal?.scanning;
+  return (
+    <ModalShell title="LLDP Discovery Results" caption="Matched devices, unknown neighbors, and LLDP scan errors." actions={actions} wide className="lldp-modal-card">
+      <TopologyDiscoveryResult result={result} devices={devices} scanning={scanning} showTitle={false} />
+      {!scanning && <div className="modal-actions"><button className="primary-button" type="button" onClick={actions.closeModal}>Done</button></div>}
+    </ModalShell>
+  );
+}
+
+function TopologyDiscoveryResult({ result, devices = [], scanning = false, showTitle = true }) {
+  if (scanning) {
+    return (
+      <div className="lldp-discovery-result scanning">
+        {showTitle && <div className="lldp-discovery-title"><strong>LLDP Discovery Results</strong><span>Scanning known network devices with SNMP access...</span></div>}
+        {!showTitle && <p className="lldp-empty-message">Scanning known network devices with SNMP access...</p>}
+        <div className="lldp-progress-line" />
+      </div>
+    );
+  }
+  if (!result) return null;
+  const summary = result.summary || {};
+  const discovered = (result.results || []).flatMap((item) => item.neighbors || item.links || []);
+  const matchedNeighbors = discovered.filter((neighbor) => neighbor.targetDeviceId);
+  const unmatched = result.unmatchedNeighbors || discovered.filter((neighbor) => !neighbor.targetDeviceId);
+  const errors = result.errors || [];
+  const scanned = summary.scanned ?? result.devices ?? 0;
+  const matched = summary.matched ?? 0;
+  const unmatchedCount = summary.unmatched ?? unmatched.length;
+  const errorCount = summary.errors || errors.length;
+  const emptyMessage = scanned === 0
+    ? "No devices with SNMP credentials or SNMP sensors were found."
+    : matched === 0 && unmatchedCount === 0 && errorCount === 0
+      ? "No LLDP neighbors found."
+      : "";
+  return (
+    <div className="lldp-discovery-result">
+      {showTitle && <div className="lldp-discovery-title"><strong>LLDP Discovery Results</strong><span>Neighbors found from known network devices with SNMP access.</span></div>}
+      <div className="lldp-discovery-stats">
+        <span><strong>{scanned}</strong> scanned</span>
+        <span><strong>{matched}</strong> matched</span>
+        <span><strong>{unmatchedCount}</strong> unmatched</span>
+        {!!errorCount && <span className="danger"><strong>{errorCount}</strong> errors</span>}
+      </div>
+      {emptyMessage && <p className="lldp-empty-message">{emptyMessage}</p>}
+      {!!matchedNeighbors.length && <LldpNeighborSection title="Matched Devices" status="matched" neighbors={matchedNeighbors} devices={devices} />}
+      {!!unmatched.length && <LldpNeighborSection title="Not In Devices" status="unmatched" neighbors={unmatched} devices={devices} />}
+      {!!errors.length && <LldpErrorSection errors={errors} devices={devices} />}
+    </div>
+  );
+}
+
+function LldpNeighborSection({ title, status, neighbors, devices }) {
+  return (
+    <section className={`lldp-result-section ${status}`}>
+      <div className="lldp-section-head"><strong>{title}</strong><span>{neighbors.length}</span></div>
+      <div className="lldp-result-list">
+        {neighbors.map((neighbor, index) => (
+          <article className="lldp-result-row" key={`${neighbor.sourceDeviceId}-${neighbor.localPort}-${neighbor.remoteSystemName}-${neighbor.remotePort}-${index}`}>
+            <div className="lldp-neighbor-main">
+              <strong>{neighbor.remoteSystemName || neighbor.remoteManagementIp || neighbor.remoteChassisId || "Unknown neighbor"}</strong>
+              <span>{[neighbor.remoteManagementIp, neighbor.remoteChassisId].filter(Boolean).join(" / ") || "No management address"}</span>
+            </div>
+            <div className="lldp-neighbor-path">
+              <span>via {neighbor.sourceDeviceName || deviceNameById(devices, neighbor.sourceDeviceId) || "Source"} <b>{topologyPortLabel(neighbor.localPort) || "-"}</b></span>
+              <span>{neighbor.targetDeviceId ? `to ${neighbor.targetDeviceName || deviceNameById(devices, neighbor.targetDeviceId) || "Target"}` : "remote port"} <b>{topologyPortLabel(neighbor.remotePort) || "-"}</b></span>
+            </div>
+            <span className={`lldp-row-state ${status}`}>{status === "matched" ? "Matched" : "Not in devices"}</span>
+          </article>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function LldpErrorSection({ errors, devices }) {
+  return (
+    <section className="lldp-result-section errors">
+      <div className="lldp-section-head"><strong>Errors</strong><span>{errors.length}</span></div>
+      <div className="lldp-result-list">
+        {errors.map((error, index) => (
+          <article className="lldp-result-row" key={`${error.deviceId}-${index}`}>
+            <div className="lldp-neighbor-main"><strong>{deviceNameById(devices, error.deviceId) || `Device ${error.deviceId || "-"}`}</strong><span>{error.error || "LLDP scan failed"}</span></div>
+            <span className="lldp-row-state error">Error</span>
+          </article>
+        ))}
+      </div>
+    </section>
   );
 }
 
@@ -497,8 +621,7 @@ function DeviceDetail({ selectedDevice, data, deviceDetailTab, portSamples, acti
         <div className="device-summary-body">
           <DeviceGroupEditor device={selectedDevice} actions={actions} />
           <div className="device-summary-details">
-            {detailRow("SNMP", selectedDevice.snmpEnabled ? "Enabled" : "Disabled")}
-            {detailRow("SNMP Port", selectedDevice.snmpPort || 161)}
+            {detailRow("Default SNMP Port", selectedDevice.snmpPort || 161)}
             {detailRow("Notes", selectedDevice.notes || "-")}
           </div>
           <div className="danger-zone"><button className="mini-action danger" type="button" onClick={() => actions.deleteDevice(selectedDevice)}>{icon("trash")} Delete Device</button></div>
@@ -587,8 +710,8 @@ function DevicesView({ data, actions }) {
       <section className="panel">
         <div className="panel-head"><div><h2>Devices</h2><p>Routers, switches, servers, printers, NAS, and probes.</p></div><button className="primary-button" type="button" onClick={() => actions.openModal({ type: "device" })}>{icon("plus")} Device</button></div>
         <div className="scrollable-table-shell">
-          <table><thead><tr><th>Status</th><th>Device</th><th>Host</th><th>Group</th><th>SNMP</th><th>Tags</th><th>Actions</th></tr></thead><tbody>
-            {data.devices.map((device) => <tr key={device.id} onClick={() => actions.setRoute({ view: "device-detail", deviceId: device.id })}><td><StatusBadge status={device.status} /></td><td>{device.name}</td><td>{device.host}</td><td>{device.group}</td><td>{device.snmpEnabled ? "Enabled" : "Disabled"}</td><td>{Array.isArray(device.tags) ? device.tags.join(", ") : device.tags || "-"}</td><td><button className="mini-action danger" type="button" onClick={(event) => { event.stopPropagation(); actions.deleteDevice(device); }}>{icon("trash")} Delete</button></td></tr>)}
+          <table><thead><tr><th>Status</th><th>Device</th><th>Host</th><th>Group</th><th>Tags</th><th>Actions</th></tr></thead><tbody>
+            {data.devices.map((device) => <tr key={device.id} onClick={() => actions.setRoute({ view: "device-detail", deviceId: device.id })}><td><StatusBadge status={device.status} /></td><td>{device.name}</td><td>{device.host}</td><td>{device.group}</td><td>{Array.isArray(device.tags) ? device.tags.join(", ") : device.tags || "-"}</td><td><button className="mini-action danger" type="button" onClick={(event) => { event.stopPropagation(); actions.deleteDevice(device); }}>{icon("trash")} Delete</button></td></tr>)}
           </tbody></table>
         </div>
       </section>
@@ -808,13 +931,14 @@ function ModalHost({ modal, actions, data }) {
   if (modal.type === "sensor") return <SensorModal device={device} actions={actions} />;
   if (modal.type === "traffic") return <TrafficModal device={device} sensors={data.sensors} actions={actions} />;
   if (modal.type === "internet-monitor") return <InternetMonitorModal actions={actions} ui={{ ModalShell, FormMessage, ModalActions }} />;
+  if (modal.type === "lldp-results") return <LldpDiscoveryModal modal={modal} devices={data.devices} actions={actions} />;
   return null;
 }
 
-function ModalShell({ title, caption, children, actions, wide = false }) {
+function ModalShell({ title, caption, children, actions, wide = false, className = "" }) {
   return (
     <dialog open>
-      <div className={`modal-card ${wide ? "" : "compact-modal"}`}>
+      <div className={`modal-card ${wide ? "" : "compact-modal"} ${className}`}>
         <div className="modal-head"><div><h2>{title}</h2><p>{caption}</p></div><button className="icon-button" type="button" onClick={actions.closeModal} aria-label="Close">{icon("close")}</button></div>
         {children}
       </div>
@@ -823,7 +947,7 @@ function ModalShell({ title, caption, children, actions, wide = false }) {
 }
 
 function DeviceModal({ modal, actions }) {
-  const [form, setForm] = useState({ name: "", host: "", group: modal.groupName || "", snmpPort: 161, snmpEnabled: false, snmpCommunity: "", tags: "", notes: "" });
+  const [form, setForm] = useState({ name: "", host: "", group: modal.groupName || "", snmpPort: 161, snmpCommunity: "", tags: "", notes: "" });
   const [error, setError] = useState("");
   function update(name, value) {
     setForm((current) => ({ ...current, [name]: value }));
@@ -845,8 +969,7 @@ function DeviceModal({ modal, actions }) {
           <label>Name<input required value={form.name} onChange={(event) => update("name", event.target.value)} placeholder="Core Switch" /></label>
           <label>Host<input required value={form.host} onChange={(event) => update("host", event.target.value)} placeholder="192.168.1.1" /></label>
           <label>Group<input value={form.group} onChange={(event) => update("group", event.target.value)} placeholder="Core Network" /></label>
-          <label>SNMP Port<input type="number" value={form.snmpPort} onChange={(event) => update("snmpPort", event.target.value)} /></label>
-          <label className="wide check-label"><input type="checkbox" checked={form.snmpEnabled} onChange={(event) => update("snmpEnabled", event.target.checked)} /> Enable SNMP v2c for this device</label>
+          <label>Default SNMP Port<input type="number" value={form.snmpPort} onChange={(event) => update("snmpPort", event.target.value)} /></label>
           <label className="wide">SNMP v2c Community<input type="password" value={form.snmpCommunity} onChange={(event) => update("snmpCommunity", event.target.value)} placeholder="public" /></label>
           <label className="wide">Tags<input value={form.tags} onChange={(event) => update("tags", event.target.value)} placeholder="switch, core" /></label>
           <label className="wide">Notes<textarea value={form.notes} onChange={(event) => update("notes", event.target.value)} placeholder="Location, model, owner, or maintenance notes" /></label>
@@ -1052,18 +1175,37 @@ function EventsList({ events }) {
   return <div className="event-list">{events.map((event) => <article className={`event-row ${event.status || "unknown"}`} key={event.id}><span className={`event-dot ${event.status || "unknown"}`} /><div className="event-copy"><strong>{event.title}</strong><small>{event.message || "-"}</small></div><time>{formatDateTime(event.createdAt)}</time></article>)}</div>;
 }
 
-function Topology({ devices, actions }) {
+function Topology({ devices, links = [], actions }) {
   const [positions, setPositions] = useState({});
   const dragRef = useRef(null);
   const suppressClickRef = useRef(false);
   const canvasRef = useRef(null);
   useEffect(() => setPositions({}), [devices.map((device) => `${device.id}:${device.topologyX}:${device.topologyY}`).join("|")]);
   if (!devices.length) return emptyState("No devices", "Add devices to populate topology.");
+  const visibleDevices = devices.slice(0, 12);
+  const visibleIds = new Set(visibleDevices.map((device) => String(device.id)));
   function positionFor(device, index) {
     const transient = positions[device.id];
     if (transient) return transient;
     return { x: clampPercent(device.topologyX ?? (18 + (index % 4) * 22), 8, 92), y: clampPercent(device.topologyY ?? (22 + Math.floor(index / 4) * 26), 12, 88) };
   }
+  const positionedDevices = visibleDevices.map((device, index) => ({ device, index, position: positionFor(device, index) }));
+  const positionById = Object.fromEntries(positionedDevices.map((item) => [String(item.device.id), item.position]));
+  const drawableLinks = collapseTopologyLinks(links.filter((link) => visibleIds.has(String(link.sourceDeviceId)) && visibleIds.has(String(link.targetDeviceId))));
+  const renderedLinks = drawableLinks.map((link) => {
+    const source = positionById[String(link.sourceDeviceId)];
+    const target = positionById[String(link.targetDeviceId)];
+    if (!source || !target) return null;
+    return {
+      link,
+      source,
+      target,
+      localLabel: topologyPortLabel(link.localPort),
+      remoteLabel: topologyPortLabel(link.remotePortId || link.remotePort),
+      localPoint: topologyLabelPoint(source, target, 0.22),
+      remotePoint: topologyLabelPoint(source, target, 0.78),
+    };
+  }).filter(Boolean);
   function pointerDown(event, device, index) {
     const rect = canvasRef.current?.getBoundingClientRect();
     if (!rect) return;
@@ -1095,8 +1237,20 @@ function Topology({ devices, actions }) {
   }
   return (
     <div className="topology-map topology-canvas" ref={canvasRef} onPointerMove={pointerMove} onPointerUp={pointerUp} onPointerCancel={() => { dragRef.current = null; }}>
-      {devices.slice(0, 12).map((device, index) => {
-        const position = positionFor(device, index);
+      <svg className="topology-links" viewBox="0 0 100 100" preserveAspectRatio="none" aria-hidden="true">
+        {renderedLinks.map(({ link, source, target }) => {
+          return (
+            <g className={`topology-link ${link.protocol || "lldp"}`} key={link.id || `${link.sourceDeviceId}-${link.targetDeviceId}-${link.localPort}`}>
+              <line className="topology-link-line" x1={source.x} y1={source.y} x2={target.x} y2={target.y} />
+            </g>
+          );
+        })}
+      </svg>
+      {renderedLinks.flatMap(({ link, localLabel, remoteLabel, localPoint, remotePoint }) => [
+        localLabel ? <span className="topology-port-label source" key={`${link.id || link.localPort}-source`} style={{ left: `${localPoint.x}%`, top: `${localPoint.y}%` }} title={link.localPort}>{localLabel}</span> : null,
+        remoteLabel ? <span className="topology-port-label target" key={`${link.id || link.remotePort}-target`} style={{ left: `${remotePoint.x}%`, top: `${remotePoint.y}%` }} title={link.remotePortId || link.remotePort}>{remoteLabel}</span> : null,
+      ])}
+      {positionedDevices.map(({ device, index, position }) => {
         return <button className={`topology-node ${device.status || "unknown"}`} key={device.id} type="button" style={{ left: `${position.x}%`, top: `${position.y}%` }} onPointerDown={(event) => pointerDown(event, device, index)} onClick={(event) => { if (suppressClickRef.current) { suppressClickRef.current = false; return; } if (event.detail === 0) actions.setRoute({ view: "device-detail", deviceId: device.id }); }}><span /><strong>{device.name}</strong><small>{device.host}</small></button>;
       })}
     </div>
@@ -1366,7 +1520,25 @@ function groupDevices(groups, devices) {
 }
 
 function isInternetSystemDevice(device) {
-  return String(device?.name || "") === internetDeviceName && String(device?.host || "") === internetDeviceHost;
+  const tags = Array.isArray(device?.tags) ? device.tags : [];
+  return String(device?.name || "") === internetDeviceName
+    && (String(device?.host || "") === internetDeviceHost || String(device?.group || "") === internetDeviceGroup || tags.includes("system") || tags.includes("internet"));
+}
+
+function buildLocalNetworkData(data) {
+  const devices = data.devices.filter((device) => !isInternetSystemDevice(device));
+  const deviceIds = new Set(devices.map((device) => String(device.id)));
+  const sensors = data.sensors.filter((sensor) => sensor.type !== "http" && deviceIds.has(String(sensor.deviceId)));
+  const sensorIds = new Set(sensors.map((sensor) => String(sensor.id)));
+  const events = data.events.filter((event) => {
+    if (event.sensorId) return sensorIds.has(String(event.sensorId));
+    return deviceIds.has(String(event.deviceId));
+  });
+  const topologyLinks = data.topologyLinks.filter((link) => deviceIds.has(String(link.sourceDeviceId)) && deviceIds.has(String(link.targetDeviceId)));
+  const summary = summarizeSensorStatuses(sensors);
+  summary.devices = devices.length;
+  summary.sensors = sensors.length;
+  return { ...data, devices, sensors, events, topologyLinks, summary };
 }
 
 function summarizeSensorStatuses(sensors) {
@@ -1551,6 +1723,86 @@ function formatRate(value) {
 
 function shortInterfaceName(value) {
   return String(value || "").trim().replace(/^Ten-GigabitEthernet/i, "Te").replace(/^M-GigabitEthernet/i, "M-Gi").replace(/^GigabitEthernet/i, "Gi").replace(/^Bridge-Aggregation/i, "BAGG").replace(/^Vlan-interface/i, "Vlan").replace(/\s+/g, " ");
+}
+
+function topologyPairKey(link) {
+  const a = String(link.sourceDeviceId || "");
+  const b = String(link.targetDeviceId || "");
+  return [a, b].sort().join(":");
+}
+
+function topologyInterfaceToken(value) {
+  const token = shortInterfaceName(value).split(/\s+/)[0] || "";
+  const normalized = token.replace(/[(),]/g, "");
+  if (!normalized) return "";
+  const patterns = [
+    /^Gi\d/i,
+    /^Te\d/i,
+    /^Fa\d/i,
+    /^Eth\d/i,
+    /^Ethernet\d/i,
+    /^GE\d/i,
+    /^XGE\d/i,
+    /^M-Gi\d/i,
+    /^BAGG\d/i,
+    /^Vlan\d/i,
+    /^Po\d/i,
+    /^Port-channel\d/i,
+    /^Loopback\d/i,
+    /^InLoopBack\d/i,
+    /^NULL\d/i,
+  ];
+  return patterns.some((pattern) => pattern.test(normalized)) ? normalized : "";
+}
+
+function topologyPortScore(value) {
+  const token = topologyInterfaceToken(value);
+  if (!token) return 0;
+  if (/^(Gi|Te|Fa|Eth|Ethernet|GE|XGE|M-Gi)\d/i.test(token)) return 6;
+  if (/^(BAGG|Po|Port-channel)\d/i.test(token)) return 4;
+  if (/^(Vlan|Loopback|InLoopBack|NULL)\d/i.test(token)) return 2;
+  return 1;
+}
+
+function topologyLinkScore(link) {
+  const sourceScore = topologyPortScore(link.localPort);
+  const targetScore = topologyPortScore(link.remotePortId || link.remotePort);
+  const targetIdBonus = link.remotePortId ? 2 : 0;
+  return sourceScore + targetScore + targetIdBonus;
+}
+
+function collapseTopologyLinks(links) {
+  const grouped = new Map();
+  for (const link of links) {
+    if (!link.sourceDeviceId || !link.targetDeviceId) continue;
+    const key = topologyPairKey(link);
+    const current = grouped.get(key);
+    if (!current || topologyLinkScore(link) > topologyLinkScore(current)) grouped.set(key, link);
+  }
+  return Array.from(grouped.values());
+}
+
+function topologyPortLabel(value) {
+  const label = topologyInterfaceToken(value);
+  if (!label) return "";
+  return label.length > 18 ? `${label.slice(0, 17)}...` : label;
+}
+
+function topologyLabelPoint(source, target, ratio) {
+  const x = source.x + (target.x - source.x) * ratio;
+  const y = source.y + (target.y - source.y) * ratio;
+  const dx = target.x - source.x;
+  const dy = target.y - source.y;
+  const length = Math.max(1, Math.hypot(dx, dy));
+  const offset = Math.min(3.2, Math.max(1.7, length * 0.045));
+  return {
+    x: clampPercent(x + (-dy / length) * offset, 6, 94),
+    y: clampPercent(y + (dx / length) * offset, 8, 92),
+  };
+}
+
+function deviceNameById(devices, id) {
+  return devices.find((device) => String(device.id) === String(id))?.name || "";
 }
 
 function formatAxisValue(value, scale) {
