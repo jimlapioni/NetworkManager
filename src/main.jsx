@@ -3,6 +3,7 @@ import { createRoot } from "react-dom/client";
 import "../styles.css";
 import { apiRequest, authTokenStorageKey, emptySummary, normalizeList, normalizeSummary } from "./api.js";
 import { chartDomain, chartLineSegments, chartPlot, chartSampleX, chartScale, chartTimeTicks, chartVisibleSamples, chartY, clampChartValue, clampPercent, formatAxisValue, formatDateTime, formatNullableRate, formatRate, isFiniteNumber, miniChartPoints, niceAxisMax, nullableNumber, sampleIssueText, shortInterfaceName } from "./charts.js";
+import { defaultInternetMonitorName, defaultPortRule, describeClientRule, newDiscoveredTrafficInterfaces, normalizeClientThresholdRule, normalizeThresholdRules, operatorOptions, percentToMbps, portMetricOptions, ruleModeLabel, ruleSummaryTitle, thresholdForm, thresholdHint } from "./forms.js";
 import { parseRouteHash, routeHash } from "./routing.js";
 import { InternetMonitorModal, InternetView, internetDeviceGroup, internetDeviceHost, internetDeviceName } from "./features/internet.jsx";
 import { FormMessage, Header, ModalActions, ModalShell, NavButton, StatusBadge, emptyState, icon, metricCard } from "./features/layout.jsx";
@@ -1430,121 +1431,6 @@ function ChartGrid({ max, scale, domain }) {
   return <><g className="chart-grid"><line x1={chartPlot.left} y1={chartPlot.top} x2={chartPlot.left} y2={chartPlot.bottom} /><line x1={chartPlot.left} y1={chartPlot.bottom} x2={chartPlot.right} y2={chartPlot.bottom} />{timeTicks.map((tick) => <line key={`x-${tick.time}`} x1={tick.x} y1={chartPlot.top} x2={tick.x} y2={chartPlot.bottom} />)}{yTicks.map((ratio) => { const y = chartPlot.bottom - ratio * chartPlot.height; return <line key={`y-${ratio}`} x1={chartPlot.left} y1={y} x2={chartPlot.right} y2={y} />; })}</g><g className="chart-axis-labels">{yTicks.map((ratio) => { const y = chartPlot.bottom - ratio * chartPlot.height; return <text key={`yl-${ratio}`} x={chartPlot.left - 10} y={y + 4} textAnchor="end">{formatAxisValue(max * ratio, scale)}</text>; })}{timeTicks.map((tick) => <text className="chart-time-label" key={`tl-${tick.time}`} x={tick.x} y="294" textAnchor="middle">{tick.label}</text>)}<text className="chart-axis-title" x={chartPlot.left} y="20" textAnchor="start">{scale.unit}</text><text className="chart-axis-title" x={(chartPlot.left + chartPlot.right) / 2} y="320" textAnchor="middle">Time</text></g></>;
 }
 
-function thresholdForm(threshold, defaultMetric) {
-  return {
-    enabled: !!threshold?.enabled,
-    metric: threshold?.metric || defaultMetric,
-    warningOperator: threshold?.warningOperator || "",
-    warningValue: threshold?.warningValue ?? "",
-    criticalOperator: threshold?.criticalOperator || "",
-    criticalValue: threshold?.criticalValue ?? "",
-  };
-}
-
-function portMetricOptions() {
-  return [
-    ["maxBps", "Max Traffic"],
-    ["inBps", "Inbound"],
-    ["outBps", "Outbound"],
-  ];
-}
-
-function defaultPortRule(severity = "warning", direction = "above") {
-  const percent = direction === "below" ? (severity === "critical" ? 1 : 5) : (severity === "critical" ? 95 : 80);
-  return {
-    clientId: `draft-${Date.now()}-${Math.random().toString(16).slice(2)}`,
-    enabled: true,
-    severity,
-    metric: "maxBps",
-    direction,
-    mode: "percent",
-    percent,
-    absoluteMbps: "",
-    label: "",
-  };
-}
-
-function defaultInternetMonitorName(url) {
-  try {
-    const parsed = new URL(String(url || ""));
-    return parsed.hostname || "HTTP Monitor";
-  } catch {
-    return "HTTP Monitor";
-  }
-}
-
-function normalizeThresholdRules(threshold) {
-  return (threshold?.rules || []).map((rule) => normalizeClientThresholdRule(rule));
-}
-
-function normalizeClientThresholdRule(rule) {
-  const mode = rule.mode === "absolute_mbps" ? "absolute_mbps" : "percent";
-  return {
-    id: rule.id,
-    clientId: rule.clientId || `rule-${rule.id || Date.now()}-${Math.random().toString(16).slice(2)}`,
-    enabled: rule.enabled !== false,
-    severity: rule.severity === "critical" ? "critical" : "warning",
-    metric: ["maxBps", "inBps", "outBps"].includes(rule.metric) ? rule.metric : "maxBps",
-    direction: rule.direction === "below" ? "below" : "above",
-    mode,
-    percent: mode === "percent" ? Number(rule.percent ?? 80) : "",
-    absoluteMbps: mode === "absolute_mbps" ? Number(rule.absoluteMbps ?? rule.absolute_mbps ?? 0) : "",
-    label: rule.label || "",
-  };
-}
-
-function percentToMbps(percent, interfaceSpeed) {
-  const bps = Number(interfaceSpeed || 0) * Number(percent || 0) / 100;
-  return Number.isFinite(bps) ? Number((bps / 1_000_000).toFixed(2)) : "";
-}
-
-function ruleLimitBps(rule, interfaceSpeed) {
-  if (rule.mode === "absolute_mbps") return Number(rule.absoluteMbps || 0) * 1_000_000;
-  return Number(interfaceSpeed || 0) * Number(rule.percent || 0) / 100;
-}
-
-function describeClientRule(rule, interfaceSpeed) {
-  const metric = Object.fromEntries(portMetricOptions())[rule.metric] || "Max Traffic";
-  const severity = rule.severity === "critical" ? "Critical" : "Warning";
-  const sign = rule.direction === "below" ? "<" : ">";
-  const target = rule.mode === "absolute_mbps"
-    ? `${Number(rule.absoluteMbps || 0).toLocaleString()} Mbps`
-    : `${Number(rule.percent || 0).toLocaleString()}% of ${formatRate(interfaceSpeed || 0)}`;
-  const limit = ruleLimitBps(rule, interfaceSpeed);
-  const converted = limit ? ` (${formatRate(limit)})` : "";
-  return `${severity} when ${metric} ${sign} ${target}${converted}`;
-}
-
-function ruleSummaryTitle(rule) {
-  const metric = Object.fromEntries(portMetricOptions())[rule.metric] || "Max Traffic";
-  const sign = rule.direction === "below" ? "<" : ">";
-  const value = rule.mode === "absolute_mbps"
-    ? `${Number(rule.absoluteMbps || 0).toLocaleString()} Mbps`
-    : `${Number(rule.percent || 0).toLocaleString()}%`;
-  return `${metric} ${sign} ${value}`;
-}
-
-function ruleModeLabel(rule) {
-  return rule.mode === "absolute_mbps" ? "Advanced Mbps rule" : "Port speed percent rule";
-}
-
-function operatorOptions() {
-  return [
-    ["", "Disabled"],
-    [">", ">"],
-    [">=", ">="],
-    ["<", "<"],
-    ["<=", "<="],
-    ["==", "=="],
-    ["!=", "!="],
-  ];
-}
-
-function thresholdHint(sensor) {
-  if (sensor.type === "snmp_traffic") return "Traffic thresholds use bps values. Example: 800000000 for 800 Mbps.";
-  return "Numeric thresholds apply to the parsed sample value. Text-only SNMP values will not trigger numeric thresholds.";
-}
-
 function groupDevices(groups, devices) {
   const map = new Map();
   groups.forEach((group) => {
@@ -1589,37 +1475,6 @@ function summarizeSensorStatuses(sensors) {
     summary[status] = (summary[status] || 0) + 1;
   });
   return summary;
-}
-
-function existingTrafficKeys(sensors, deviceId) {
-  const keys = { indexes: new Set(), oids: new Set() };
-  sensors.filter((sensor) => String(sensor.deviceId) === String(deviceId) && sensor.type === "snmp_traffic").forEach((sensor) => {
-    if (sensor.config?.index) keys.indexes.add(String(sensor.config.index));
-    ["speedOid", "inOid", "outOid"].forEach((name) => {
-      const oid = normalizeClientOid(sensor.config?.[name]);
-      if (oid) keys.oids.add(oid);
-    });
-  });
-  return keys;
-}
-
-function newDiscoveredTrafficInterfaces(items, sensors, deviceId) {
-  const existing = existingTrafficKeys(sensors, deviceId);
-  const requestIndexes = new Set();
-  const requestOids = new Set();
-  return items.filter((item) => {
-    const index = String(item.index || "").trim();
-    if (!index || existing.indexes.has(index) || requestIndexes.has(index)) return false;
-    const oids = ["speedOid", "inOid", "outOid"].map((name) => normalizeClientOid(item[name])).filter(Boolean);
-    if (oids.some((oid) => existing.oids.has(oid) || requestOids.has(oid))) return false;
-    requestIndexes.add(index);
-    oids.forEach((oid) => requestOids.add(oid));
-    return true;
-  });
-}
-
-function normalizeClientOid(value) {
-  return String(value || "").trim().replace(/^\./, "").replace(/\s+/g, "");
 }
 
 function PortChartLegend() {
