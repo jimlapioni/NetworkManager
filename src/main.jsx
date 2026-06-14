@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { createRoot } from "react-dom/client";
 import "../styles.css";
 import { apiRequest, authTokenStorageKey, emptySummary, normalizeList, normalizeSummary } from "./api.js";
+import { chartDomain, chartLineSegments, chartPlot, chartSampleX, chartScale, chartTimeTicks, chartVisibleSamples, chartY, clampChartValue, clampPercent, formatAxisValue, formatDateTime, formatNullableRate, formatRate, isFiniteNumber, miniChartPoints, niceAxisMax, nullableNumber, sampleIssueText, shortInterfaceName } from "./charts.js";
 import { parseRouteHash, routeHash } from "./routing.js";
 import { InternetMonitorModal, InternetView, internetDeviceGroup, internetDeviceHost, internetDeviceName } from "./features/internet.jsx";
 import { FormMessage, Header, ModalActions, ModalShell, NavButton, StatusBadge, emptyState, icon, metricCard } from "./features/layout.jsx";
@@ -9,10 +10,6 @@ import { NotificationChannelModal, NotificationsView } from "./features/notifica
 import { aggregateStatus, statusLabels } from "./status.js";
 
 const deviceSerialNumberOid = "1.3.6.1.2.1.47.1.1.1.1.11";
-const chartPlot = { left: 82, right: 744, top: 36, bottom: 268 };
-chartPlot.width = chartPlot.right - chartPlot.left;
-chartPlot.height = chartPlot.bottom - chartPlot.top;
-const chartTimeStepMs = 30 * 1000;
 const internetSettingsDefault = { enabled: true };
 const sampleRangeOptions = [
   ["1h", "1H"],
@@ -1633,160 +1630,6 @@ function detailRow(label, value) {
   return <div className="detail-row"><span>{label}</span><strong>{value}</strong></div>;
 }
 
-function miniChartPoints(values, max, width, height) {
-  const topPadding = 6;
-  const bottomPadding = 6;
-  const baseline = height - bottomPadding;
-  if (values.length < 2 || max <= 0) return `0,${baseline} ${width},${baseline}`;
-  return values.map((value, index) => {
-    const x = (index / Math.max(1, values.length - 1)) * width;
-    const y = baseline - (Number(value || 0) / max) * (height - topPadding - bottomPadding);
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(" ");
-}
-
-function chartPoints(values, max, samples, domain) {
-  return values.map((value, index) => {
-    const x = chartSampleX(samples[index], index, domain);
-    const y = chartY(value, max);
-    return `${x.toFixed(1)},${y.toFixed(1)}`;
-  }).join(" ");
-}
-
-function chartLineSegments(values, max, samples, domain) {
-  const segments = [];
-  let segment = [];
-  values.forEach((value, index) => {
-    if (!isFiniteNumber(value)) {
-      if (segment.length >= 2) segments.push(segment.join(" "));
-      segment = [];
-      return;
-    }
-    const x = chartSampleX(samples[index], index, domain);
-    const y = chartY(value, max);
-    segment.push(`${x.toFixed(1)},${y.toFixed(1)}`);
-  });
-  if (segment.length >= 2) segments.push(segment.join(" "));
-  return segments;
-}
-
-function chartSampleX(sample, index, domain) {
-  const time = new Date(sample?.createdAt || "").getTime();
-  return chartX(Number.isFinite(time) ? time : domain.start + index * chartTimeStepMs, domain);
-}
-
-function chartY(value, max) {
-  return chartPlot.bottom - (Number(value || 0) / Math.max(1, max)) * chartPlot.height;
-}
-
-function clampChartValue(value, min, max) {
-  return Math.min(max, Math.max(min, value));
-}
-
-function chartDomain(samples) {
-  const times = samples.map((sample) => new Date(sample.createdAt || "").getTime()).filter((time) => Number.isFinite(time));
-  const now = Date.now();
-  const minTime = times.length ? Math.min(...times) : now - chartTimeStepMs;
-  const maxTime = times.length ? Math.max(...times) : now;
-  const duration = Math.max(chartTimeStepMs, maxTime - minTime);
-  const padding = Math.max(chartTimeStepMs, duration * 0.03);
-  let start = minTime - padding;
-  let end = maxTime + padding;
-  if (end <= start) end = start + chartTimeStepMs;
-  return { start, end };
-}
-
-function chartVisibleSamples(samples, domain) {
-  const visible = samples.filter((sample) => {
-    const time = new Date(sample.createdAt || "").getTime();
-    return Number.isFinite(time) && time >= domain.start && time <= domain.end;
-  });
-  return visible.length ? visible : samples.slice(-1);
-}
-
-function chartX(time, domain) {
-  return chartPlot.left + ((time - domain.start) / Math.max(1, domain.end - domain.start)) * chartPlot.width;
-}
-
-function chartTimeTicks(domain) {
-  const ticks = [];
-  const duration = Math.max(chartTimeStepMs, domain.end - domain.start);
-  const step = chartTickStep(duration);
-  const first = Math.ceil(domain.start / step) * step;
-  for (let time = first; time <= domain.end + 1; time += step) ticks.push({ time, label: formatChartTimeLabel(time, duration), x: chartX(time, domain) });
-  return ticks;
-}
-
-function chartTickStep(duration) {
-  if (duration <= 2 * 60 * 60 * 1000) return 10 * 60 * 1000;
-  if (duration <= 36 * 60 * 60 * 1000) return 4 * 60 * 60 * 1000;
-  if (duration <= 10 * 24 * 60 * 60 * 1000) return 24 * 60 * 60 * 1000;
-  return 5 * 24 * 60 * 60 * 1000;
-}
-
-function chartScale(max, type, unit = "") {
-  if (type === "rate") {
-    const units = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"];
-    let divisor = 1;
-    let selected = units[0];
-    for (const candidate of units) {
-      selected = candidate;
-      if (max / divisor < 1000 || candidate === units.at(-1)) break;
-      divisor *= 1000;
-    }
-    return { divisor, unit: selected };
-  }
-  return { divisor: 1, unit: unit || "value" };
-}
-
-function niceAxisMax(value) {
-  const number = Number(value || 0);
-  if (!Number.isFinite(number) || number <= 0) return 1;
-  const padded = number * 1.12;
-  const exponent = Math.floor(Math.log10(padded));
-  const base = 10 ** exponent;
-  const normalized = padded / base;
-  const step = normalized <= 1 ? 1 : normalized <= 2 ? 2 : normalized <= 5 ? 5 : 10;
-  return step * base;
-}
-
-function nullableNumber(value) {
-  if (value === null || value === undefined || value === "") return null;
-  const number = Number(value);
-  return Number.isFinite(number) ? number : null;
-}
-
-function isFiniteNumber(value) {
-  return typeof value === "number" && Number.isFinite(value);
-}
-
-function formatRate(value) {
-  let current = Number(value || 0);
-  const units = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"];
-  let unit = units[0];
-  for (let index = 0; index < units.length - 1 && Math.abs(current) >= 1000; index += 1) {
-    current /= 1000;
-    unit = units[index + 1];
-  }
-  return `${current.toFixed(2)} ${unit}`;
-}
-
-function formatNullableRate(value) {
-  return isFiniteNumber(value) ? formatRate(value) : "-";
-}
-
-function sampleIssueText(sample) {
-  const status = statusLabels[sample?.status] || "No data";
-  const value = String(sample?.valueText || "").trim();
-  const text = value && value !== "-" ? value : "No numeric data";
-  const message = `${status}: ${text}`;
-  return message.length > 36 ? `${message.slice(0, 33)}...` : message;
-}
-
-function shortInterfaceName(value) {
-  return String(value || "").trim().replace(/^Ten-GigabitEthernet/i, "Te").replace(/^M-GigabitEthernet/i, "M-Gi").replace(/^GigabitEthernet/i, "Gi").replace(/^Bridge-Aggregation/i, "BAGG").replace(/^Vlan-interface/i, "Vlan").replace(/\s+/g, " ");
-}
-
 function topologyPairKey(link) {
   const a = String(link.sourceDeviceId || "");
   const b = String(link.targetDeviceId || "");
@@ -1895,33 +1738,6 @@ function annotateNeighborWithDiscoveredNode(neighbor, discoveredNodes) {
 
 function deviceNameById(devices, id) {
   return devices.find((device) => String(device.id) === String(id))?.name || "";
-}
-
-function formatAxisValue(value, scale) {
-  const scaled = Number(value || 0) / scale.divisor;
-  if (Math.abs(scaled) >= 100) return scaled.toFixed(0);
-  if (Math.abs(scaled) >= 10) return scaled.toFixed(1);
-  return scaled.toFixed(2);
-}
-
-function formatChartTimeLabel(value, duration = 0) {
-  const date = new Date(value || "");
-  if (Number.isNaN(date.getTime())) return "-";
-  if (duration > 36 * 60 * 60 * 1000) return `${String(date.getMonth() + 1).padStart(2, "0")}/${String(date.getDate()).padStart(2, "0")}`;
-  if (duration > 2 * 60 * 60 * 1000) return `${String(date.getDate()).padStart(2, "0")}/${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
-  return `${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}`;
-}
-
-function formatDateTime(value) {
-  const date = new Date(value || "");
-  if (Number.isNaN(date.getTime())) return value || "-";
-  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, "0")}-${String(date.getDate()).padStart(2, "0")} ${String(date.getHours()).padStart(2, "0")}:${String(date.getMinutes()).padStart(2, "0")}:${String(date.getSeconds()).padStart(2, "0")}`;
-}
-
-function clampPercent(value, min, max) {
-  const number = Number(value);
-  if (!Number.isFinite(number)) return min;
-  return Math.min(max, Math.max(min, number));
 }
 
 const rootElement = document.getElementById("root");
