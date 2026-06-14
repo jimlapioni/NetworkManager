@@ -213,6 +213,12 @@ def init_db() -> None:
                 FOREIGN KEY(user_id) REFERENCES users(id) ON DELETE CASCADE
             );
 
+            CREATE TABLE IF NOT EXISTS app_settings (
+                key TEXT PRIMARY KEY,
+                value_json TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
             CREATE TABLE IF NOT EXISTS sensor_thresholds (
                 sensor_id INTEGER PRIMARY KEY,
                 metric TEXT NOT NULL DEFAULT 'value_number',
@@ -282,6 +288,7 @@ def init_db() -> None:
             );
 
             CREATE INDEX IF NOT EXISTS idx_samples_sensor_created ON samples(sensor_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_samples_sensor_id ON samples(sensor_id, id DESC);
             CREATE INDEX IF NOT EXISTS idx_samples_created ON samples(created_at);
             CREATE INDEX IF NOT EXISTS idx_sample_rollups_sensor_bucket_start ON sample_rollups(sensor_id, bucket, bucket_start);
             CREATE INDEX IF NOT EXISTS idx_sample_rollups_bucket_start ON sample_rollups(bucket, bucket_start);
@@ -295,6 +302,7 @@ def init_db() -> None:
         ensure_column(connection, "devices", "topology_y", "REAL")
         ensure_column(connection, "samples", "meta_json", "TEXT NOT NULL DEFAULT '{}'")
         ensure_column(connection, "topology_links", "remote_management_ip", "TEXT NOT NULL DEFAULT ''")
+        canonicalize_internet_system_devices(connection)
         sync_groups_from_devices(connection)
         bootstrap_admin_from_env(connection)
 
@@ -512,6 +520,82 @@ def is_internet_system_device_row(row) -> bool:
     )
 
 
+def internet_device_where(alias: str = "devices") -> str:
+    return (
+        f"{alias}.name = ? AND ("
+        f"{alias}.host = ? OR {alias}.group_name = ? OR "
+        f"instr(',' || lower({alias}.tags) || ',', ',system,') > 0)"
+    )
+
+
+def internet_device_params() -> list[str]:
+    return [INTERNET_DEVICE_NAME, INTERNET_DEVICE_HOST, INTERNET_DEVICE_GROUP]
+
+
+def include_internet_scope(filters: dict | None = None) -> bool:
+    filters = filters or {}
+    scope = str(filters.get("scope") or "").strip().lower()
+    return scope in {"all", "internet"} or query_flag(filters, "includeInternet") or query_flag(filters, "includeSystem")
+
+
+def canonicalize_internet_system_devices(connection: sqlite3.Connection) -> None:
+    rows = connection.execute("SELECT * FROM devices ORDER BY id ASC").fetchall()
+    internet_rows = [row for row in rows if is_internet_system_device_row(row)]
+    if len(internet_rows) <= 1:
+        return
+    canonical = internet_rows[0]
+    canonical_id = int(canonical["id"])
+    timestamp = now_iso()
+    for row in internet_rows[1:]:
+        duplicate_id = int(row["id"])
+        connection.execute("UPDATE sensors SET device_id = ?, updated_at = ? WHERE device_id = ? AND type = 'http'", (canonical_id, timestamp, duplicate_id))
+        connection.execute("UPDATE events SET device_id = ? WHERE device_id = ?", (canonical_id, duplicate_id))
+        connection.execute("DELETE FROM topology_links WHERE source_device_id = ? OR target_device_id = ?", (duplicate_id, duplicate_id))
+        remaining = connection.execute("SELECT COUNT(*) AS total FROM sensors WHERE device_id = ?", (duplicate_id,)).fetchone()["total"]
+        if not remaining:
+            connection.execute("DELETE FROM devices WHERE id = ?", (duplicate_id,))
+
+
+def get_setting(connection: sqlite3.Connection, key: str, default):
+    row = connection.execute("SELECT value_json FROM app_settings WHERE key = ?", (key,)).fetchone()
+    if not row:
+        return default
+    try:
+        return json.loads(row["value_json"])
+    except json.JSONDecodeError:
+        return default
+
+
+def set_setting(connection: sqlite3.Connection, key: str, value) -> None:
+    timestamp = now_iso()
+    connection.execute(
+        """
+        INSERT INTO app_settings (key, value_json, updated_at)
+        VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value_json = excluded.value_json, updated_at = excluded.updated_at
+        """,
+        (key, json.dumps(value), timestamp),
+    )
+
+
+def internet_monitoring_enabled(connection: sqlite3.Connection | None = None) -> bool:
+    if connection is not None:
+        return bool(get_setting(connection, "internet_monitoring_enabled", True))
+    with DB_LOCK, db() as check_connection:
+        return internet_monitoring_enabled(check_connection)
+
+
+def get_internet_settings() -> dict:
+    return {"enabled": internet_monitoring_enabled()}
+
+
+def save_internet_settings(payload: dict) -> dict:
+    enabled = bool(payload.get("enabled"))
+    with DB_LOCK, db() as connection:
+        set_setting(connection, "internet_monitoring_enabled", enabled)
+    return {"enabled": enabled}
+
+
 def row_to_topology_link(row: sqlite3.Row) -> dict:
     return {
         "id": row["id"],
@@ -571,9 +655,12 @@ def get_groups() -> list[dict]:
             SELECT groups.name, groups.created_at, groups.updated_at, COUNT(devices.id) AS device_count
             FROM groups
             LEFT JOIN devices ON devices.group_name = groups.name
+                AND NOT (devices.name = ? AND (devices.host = ? OR devices.group_name = ? OR instr(',' || lower(devices.tags) || ',', ',system,') > 0))
+            WHERE groups.name != ?
             GROUP BY groups.name
             ORDER BY groups.name
-            """
+            """,
+            (*internet_device_params(), INTERNET_DEVICE_GROUP),
         ).fetchall()
         return [
             {
@@ -1013,13 +1100,16 @@ def apply_threshold(sensor_id: int, sensor_type: str, status: str, value_number:
     return status, error
 
 
-def row_to_notification_channel(row: sqlite3.Row) -> dict:
+def row_to_notification_channel(row: sqlite3.Row, include_secret: bool = False) -> dict:
+    config = json.loads(row["config_json"] or "{}")
+    if not include_secret and "password" in config:
+        config = {**config, "password": ""}
     return {
         "id": row["id"],
         "name": row["name"],
         "type": row["type"],
         "enabled": bool(row["enabled"]),
-        "config": json.loads(row["config_json"] or "{}"),
+        "config": config,
         "createdAt": row["created_at"],
         "updatedAt": row["updated_at"],
     }
@@ -1046,6 +1136,12 @@ def save_notification_channel(payload: dict, channel_id: int | None = None) -> d
             )
             channel_id = cursor.lastrowid
         else:
+            existing = connection.execute("SELECT * FROM notification_channels WHERE id = ?", (channel_id,)).fetchone()
+            if not existing:
+                raise ValueError("Notification channel not found.")
+            existing_config = json.loads(existing["config_json"] or "{}")
+            if channel_type == "email" and not str(config.get("password") or "") and existing["type"] == "email":
+                config = {**config, "password": existing_config.get("password", "")}
             connection.execute(
                 "UPDATE notification_channels SET name = ?, type = ?, enabled = ?, config_json = ?, updated_at = ? WHERE id = ?",
                 (name, channel_type, 1 if payload.get("enabled", True) else 0, json.dumps(config), timestamp, channel_id),
@@ -1177,7 +1273,7 @@ def deliver_notifications_for_event(event_id: int) -> None:
     device = row_to_device(device_row) if device_row else None
     payload = notification_payload(event, sensor, device)
     for channel_row in channel_rows:
-        channel = row_to_notification_channel(channel_row)
+        channel = row_to_notification_channel(channel_row, include_secret=True)
         try:
             if channel["type"] in {"webhook", "slack_webhook", "teams_webhook"}:
                 status_code, response = deliver_webhook(channel, payload)
@@ -1189,6 +1285,29 @@ def deliver_notifications_for_event(event_id: int) -> None:
             record_notification_delivery(channel["id"], event_id, delivery_status, response, status_code)
         except Exception as exc:
             record_notification_delivery(channel["id"], event_id, "failed", str(exc), None)
+
+
+def test_notification_channel(channel_id: int) -> dict:
+    with DB_LOCK, db() as connection:
+        channel_row = connection.execute("SELECT * FROM notification_channels WHERE id = ?", (channel_id,)).fetchone()
+    if not channel_row:
+        raise ValueError("Notification channel not found.")
+    channel = row_to_notification_channel(channel_row, include_secret=True)
+    payload = {
+        "summary": "NetworkManager test notification",
+        "message": "This is a test notification from NetworkManager.",
+        "event": {"id": 0, "status": "test", "title": "Test notification", "message": "Synthetic notification test.", "createdAt": now_iso()},
+        "sensor": None,
+        "device": None,
+    }
+    if channel["type"] in {"webhook", "slack_webhook", "teams_webhook"}:
+        status_code, response = deliver_webhook(channel, payload)
+    elif channel["type"] == "email":
+        status_code, response = deliver_email(channel, payload)
+    else:
+        raise ValueError("Unsupported notification channel.")
+    ok = status_code is None or 200 <= int(status_code) < 300
+    return {"ok": ok, "statusCode": status_code, "response": response}
 
 
 def clean_snmp_text(value) -> str:
@@ -1279,6 +1398,9 @@ def get_devices(filters: dict | None = None) -> list[dict]:
     params = []
     q = str(filters.get("q") or "").strip()
     status = str(filters.get("status") or "").strip()
+    if not include_internet_scope(filters):
+        where.append(f"NOT ({internet_device_where('devices')})")
+        params.extend(internet_device_params())
     if q:
         where.append("(name LIKE ? OR host LIKE ? OR group_name LIKE ? OR tags LIKE ? OR notes LIKE ?)")
         like = f"%{q}%"
@@ -1301,9 +1423,17 @@ def get_topology_links() -> list[dict]:
     with DB_LOCK, db() as connection:
         rows = connection.execute(
             """
-            SELECT * FROM topology_links
+            SELECT topology_links.* FROM topology_links
+            JOIN devices source ON source.id = topology_links.source_device_id
+            LEFT JOIN devices target ON target.id = topology_links.target_device_id
+            WHERE NOT (source.name = ? AND (source.host = ? OR source.group_name = ? OR instr(',' || lower(source.tags) || ',', ',system,') > 0))
+              AND (
+                target.id IS NULL OR
+                NOT (target.name = ? AND (target.host = ? OR target.group_name = ? OR instr(',' || lower(target.tags) || ',', ',system,') > 0))
+              )
             ORDER BY protocol, source_device_id, local_port, remote_system_name
-            """
+            """,
+            (*internet_device_params(), *internet_device_params()),
         ).fetchall()
         return [row_to_topology_link(row) for row in rows]
 
@@ -1340,6 +1470,11 @@ def sensor_filter_clause(filters: dict | None = None) -> tuple[str, list]:
     status = str(filters.get("status") or "").strip()
     sensor_type = str(filters.get("type") or "").strip()
     device_id = str(filters.get("deviceId") or filters.get("device_id") or "").strip()
+    if not include_internet_scope(filters):
+        if sensor_type != "http":
+            where.append("sensors.type != 'http'")
+            where.append(f"NOT ({internet_device_where('devices')})")
+            params.extend(internet_device_params())
     if q:
         where.append(
             "("
@@ -1403,20 +1538,28 @@ def get_events(limit: int = 80, filters: dict | None = None) -> list[dict]:
     device_id = str(filters.get("deviceId") or filters.get("device_id") or "").strip()
     sensor_id = str(filters.get("sensorId") or filters.get("sensor_id") or "").strip()
     if status:
-        where.append("status = ?")
+        where.append("events.status = ?")
         params.append(status)
     if device_id:
-        where.append("device_id = ?")
+        where.append("events.device_id = ?")
         params.append(int(device_id))
     if sensor_id:
-        where.append("sensor_id = ?")
+        where.append("events.sensor_id = ?")
         params.append(int(sensor_id))
+    if not include_internet_scope(filters):
+        where.append("(sensors.id IS NULL OR sensors.type != 'http')")
+        where.append(f"(devices.id IS NULL OR NOT ({internet_device_where('devices')}))")
+        params.extend(internet_device_params())
     limit = min(max(1, int(filters.get("limit") or limit or 80)), 500)
     offset = max(0, int(filters.get("offset") or 0))
-    sql = "SELECT * FROM events"
+    sql = """
+        SELECT events.* FROM events
+        LEFT JOIN sensors ON sensors.id = events.sensor_id
+        LEFT JOIN devices ON devices.id = events.device_id
+    """
     if where:
         sql += " WHERE " + " AND ".join(where)
-    sql += " ORDER BY id DESC LIMIT ? OFFSET ?"
+    sql += " ORDER BY events.id DESC LIMIT ? OFFSET ?"
     params.extend([limit, offset])
     with DB_LOCK, db() as connection:
         rows = connection.execute(sql, params).fetchall()
@@ -1651,8 +1794,9 @@ def get_device_traffic_samples(device_id: int, limit: int = 24) -> dict:
             "SELECT id FROM sensors WHERE device_id = ? AND type = 'snmp_traffic' ORDER BY id DESC",
             (device_id,),
         ).fetchall()
-        grouped = {}
-        for sensor in sensors:
+        sensor_ids = [int(sensor["id"]) for sensor in sensors]
+        grouped = {str(sensor_id): [] for sensor_id in sensor_ids}
+        for sensor_id in sensor_ids:
             rows = connection.execute(
                 """
                 SELECT * FROM (
@@ -1663,17 +1807,35 @@ def get_device_traffic_samples(device_id: int, limit: int = 24) -> dict:
                 )
                 ORDER BY id ASC
                 """,
-                (sensor["id"], limit),
+                (sensor_id, limit),
             ).fetchall()
-            grouped[str(sensor["id"])] = [row_to_sample(row) for row in rows]
+            grouped[str(sensor_id)] = [row_to_sample(row) for row in rows]
     return {"ok": True, "deviceId": device_id, "limit": limit, "samples": grouped}
 
 
 def get_summary() -> dict:
     with DB_LOCK, db() as connection:
-        device_count = connection.execute("SELECT COUNT(*) FROM devices").fetchone()[0]
-        sensor_count = connection.execute("SELECT COUNT(*) FROM sensors").fetchone()[0]
-        status_rows = connection.execute("SELECT status, COUNT(*) AS count FROM sensors GROUP BY status").fetchall()
+        device_where = internet_device_where("devices")
+        params = internet_device_params()
+        device_count = connection.execute(f"SELECT COUNT(*) FROM devices WHERE NOT ({device_where})", params).fetchone()[0]
+        sensor_count = connection.execute(
+            f"""
+            SELECT COUNT(*) FROM sensors
+            LEFT JOIN devices ON devices.id = sensors.device_id
+            WHERE sensors.type != 'http' AND NOT ({device_where})
+            """,
+            params,
+        ).fetchone()[0]
+        status_rows = connection.execute(
+            f"""
+            SELECT sensors.status AS status, COUNT(*) AS count
+            FROM sensors
+            LEFT JOIN devices ON devices.id = sensors.device_id
+            WHERE sensors.type != 'http' AND NOT ({device_where})
+            GROUP BY sensors.status
+            """,
+            params,
+        ).fetchall()
 
     summary = {"devices": device_count, "sensors": sensor_count, "up": 0, "warning": 0, "down": 0, "unknown": 0}
     for row in status_rows:
@@ -1912,8 +2074,10 @@ def create_sensor(device_id: int, payload: dict) -> dict:
             ),
         )
         row = connection.execute("SELECT * FROM sensors WHERE id = ?", (cursor.lastrowid,)).fetchone()
+        should_check_now = sensor_type != "http" or internet_monitoring_enabled(connection)
     sensor = row_to_sensor(row)
-    check_sensor(sensor["id"])
+    if should_check_now:
+        check_sensor(sensor["id"])
     return get_sensor(sensor["id"])
 
 
@@ -2594,6 +2758,9 @@ def check_sensor(sensor_id: int) -> dict:
     if not row:
         raise ValueError("Sensor not found.")
 
+    if row["type"] == "http" and not internet_monitoring_enabled():
+        raise ValueError("Internet monitoring is paused.")
+
     if row["type"] == "snmp_traffic":
         if row["last_check"]:
             try:
@@ -2711,11 +2878,13 @@ def update_device_status(connection: sqlite3.Connection, device_id: int) -> None
 def scheduler() -> None:
     while True:
         try:
+            internet_enabled = internet_monitoring_enabled()
             with DB_LOCK, db() as connection:
+                sensor_type_clause = "type != 'snmp_traffic'" if internet_enabled else "type != 'snmp_traffic' AND type != 'http'"
                 non_traffic_rows = connection.execute(
-                    """
+                    f"""
                     SELECT id FROM sensors
-                    WHERE next_check_at <= ? AND type != 'snmp_traffic'
+                    WHERE next_check_at <= ? AND {sensor_type_clause}
                     ORDER BY next_check_at ASC
                     LIMIT ?
                     """,
@@ -3485,6 +3654,8 @@ class Handler(SimpleHTTPRequestHandler):
             if path == "/api/auth/me":
                 user = getattr(self, "current_user", None)
                 return self.send_json({"authenticated": bool(user), "user": user, "setupRequired": auth_setup_required(), "authDisabled": AUTH_DISABLED})
+            if path == "/api/internet/settings":
+                return self.send_json(get_internet_settings())
             if path == "/api/summary":
                 return self.send_json(get_summary())
             if path == "/api/devices":
@@ -3547,6 +3718,9 @@ class Handler(SimpleHTTPRequestHandler):
                 return self.send_json(create_api_token(int(self.current_user["id"]), payload), 201)
             if path == "/api/notification-channels":
                 return self.send_json(save_notification_channel(payload), 201)
+            match = re.fullmatch(r"/api/notification-channels/(\d+)/test", path)
+            if match:
+                return self.send_json(test_notification_channel(int(match.group(1))))
             if path == "/api/devices":
                 return self.send_json(create_device(payload), 201)
             if path == "/api/groups":
@@ -3633,6 +3807,8 @@ class Handler(SimpleHTTPRequestHandler):
             return self.send_auth_required()
         try:
             payload = self.read_json()
+            if path == "/api/internet/settings":
+                return self.send_json(save_internet_settings(payload))
             match = re.fullmatch(r"/api/sensors/(\d+)/thresholds", path)
             if match:
                 return self.send_json(save_sensor_threshold(int(match.group(1)), payload))

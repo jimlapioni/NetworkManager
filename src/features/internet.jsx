@@ -24,7 +24,7 @@ const latencyPlot = { left: 62, right: 616, top: 32, bottom: 230 };
 latencyPlot.width = latencyPlot.right - latencyPlot.left;
 latencyPlot.height = latencyPlot.bottom - latencyPlot.top;
 
-export function InternetView({ data, actions, pending, ui }) {
+export function InternetView({ data, route, actions, pending, ui }) {
   const [monitors, setMonitors] = useState([]);
   const [listLoading, setListLoading] = useState(false);
   const [listError, setListError] = useState("");
@@ -40,6 +40,7 @@ export function InternetView({ data, actions, pending, ui }) {
   const [samplesError, setSamplesError] = useState("");
   const [refreshToken, setRefreshToken] = useState(0);
   const [listRefreshToken, setListRefreshToken] = useState(0);
+  const internetEnabled = data.internetSettings?.enabled !== false;
   const summary = pager.summary || emptyInternetSummary();
   const totalMonitors = Number(pager.total || summary.total || 0);
   const upCount = Number(summary.up || 0);
@@ -49,6 +50,12 @@ export function InternetView({ data, actions, pending, ui }) {
   const selectedMonitor = monitors.find((monitor) => String(monitor.id) === String(selectedMonitorId)) || monitors[0] || null;
   const pageCount = Math.max(1, Math.ceil(totalMonitors / pageSize));
   const currentPage = Math.min(page, pageCount - 1);
+
+  useEffect(() => {
+    if (route?.monitorId && monitors.some((monitor) => String(monitor.id) === String(route.monitorId))) {
+      setSelectedMonitorId(route.monitorId);
+    }
+  }, [route?.monitorId, monitors.length]);
 
   useEffect(() => {
     let cancelled = false;
@@ -91,7 +98,7 @@ export function InternetView({ data, actions, pending, ui }) {
       cancelled = true;
       window.clearTimeout(timer);
     };
-  }, [search, statusFilter, pageSize, currentPage, listRefreshToken, data.sensors.length]);
+  }, [search, statusFilter, pageSize, currentPage, listRefreshToken, data.internetSummary?.sensors]);
 
   useEffect(() => {
     if (!monitors.length) {
@@ -129,6 +136,7 @@ export function InternetView({ data, actions, pending, ui }) {
   }, [selectedMonitor?.id, sampleRange, refreshToken]);
 
   async function checkMonitor(monitorId) {
+    if (!internetEnabled) return;
     await actions.checkSensor(monitorId);
     setListRefreshToken((current) => current + 1);
     if (String(monitorId) === String(selectedMonitor?.id)) setRefreshToken((current) => current + 1);
@@ -170,20 +178,24 @@ export function InternetView({ data, actions, pending, ui }) {
         <section className="panel internet-panel">
           <div className="panel-head">
             <div><h2>Internet Monitors</h2><p>HTTP and HTTPS uptime checks for public or internal services.</p></div>
-            <button className="primary-button" type="button" onClick={() => actions.openModal({ type: "internet-monitor" })}>{ui.icon("plus")} Monitor</button>
+            <div className="panel-head-actions">
+              <InternetMonitoringToggle enabled={internetEnabled} pending={pending} onChange={actions.setInternetMonitoringEnabled} />
+              <button className="primary-button" type="button" onClick={() => actions.openModal({ type: "internet-monitor" })}>{ui.icon("plus")} Monitor</button>
+            </div>
           </div>
+          {!internetEnabled && <div className="internet-paused-banner"><strong>Internet monitoring is paused.</strong><span>Existing monitors and history remain visible. Enable it to resume checks.</span></div>}
           <InternetMonitorFilters search={search} statusFilter={statusFilter} pageSize={pageSize} onSearch={updateSearch} onStatusFilter={updateStatusFilter} onPageSize={updatePageSize} />
           {listError && <div className="modal-note error internet-list-error">{listError}</div>}
           {listLoading && !monitors.length ? (
             <div className="internet-list-loading">Loading monitors</div>
           ) : monitors.length ? (
-            <InternetMonitorList monitors={monitors} selectedMonitorId={selectedMonitor?.id} onSelect={setSelectedMonitorId} onCheck={checkMonitor} onDelete={deleteMonitor} pending={pending} ui={ui} />
+            <InternetMonitorList monitors={monitors} selectedMonitorId={selectedMonitor?.id} onSelect={setSelectedMonitorId} onCheck={checkMonitor} onDelete={deleteMonitor} pending={pending} ui={ui} internetEnabled={internetEnabled} />
           ) : (
             ui.emptyState(search || statusFilter !== "all" ? "No matching monitors" : "No internet monitors", search || statusFilter !== "all" ? "Adjust search or filters to show more monitors." : "Add an HTTP or HTTPS monitor to start checking service availability.")
           )}
           <InternetPagination loading={listLoading} page={currentPage} pageCount={pageCount} pageSize={pageSize} total={totalMonitors} count={monitors.length} onPage={setPage} />
         </section>
-        <InternetLatencyPanel monitor={selectedMonitor} samples={samples} sampleRange={sampleRange} onRangeChange={setSampleRange} loading={samplesLoading} error={samplesError} onCheck={checkMonitor} actions={actions} pending={pending} ui={ui} />
+        <InternetLatencyPanel monitor={selectedMonitor} samples={samples} sampleRange={sampleRange} onRangeChange={setSampleRange} loading={samplesLoading} error={samplesError} onCheck={checkMonitor} actions={actions} pending={pending} ui={ui} internetEnabled={internetEnabled} />
       </div>
     </main>
   );
@@ -212,7 +224,22 @@ function InternetMonitorFilters({ search, statusFilter, pageSize, onSearch, onSt
   );
 }
 
-function InternetMonitorList({ monitors, selectedMonitorId, onSelect, onCheck, onDelete, pending, ui }) {
+function InternetMonitoringToggle({ enabled, pending, onChange }) {
+  return (
+    <button
+      className={`internet-monitoring-toggle ${enabled ? "enabled" : "paused"}`}
+      type="button"
+      disabled={pending === "internet-settings"}
+      onClick={() => onChange(!enabled)}
+      aria-pressed={enabled}
+    >
+      <span />
+      {enabled ? "Monitoring On" : "Paused"}
+    </button>
+  );
+}
+
+function InternetMonitorList({ monitors, selectedMonitorId, onSelect, onCheck, onDelete, pending, ui, internetEnabled }) {
   return (
     <div className="internet-monitor-list">
       {monitors.map((monitor) => (
@@ -230,7 +257,7 @@ function InternetMonitorList({ monitors, selectedMonitorId, onSelect, onCheck, o
             </div>
           </button>
           <div className="internet-monitor-actions">
-            <button className="mini-action internet-row-action" type="button" title="Check now" disabled={pending === `check-${monitor.id}`} onClick={() => onCheck(monitor.id)}>{ui.icon("play")}</button>
+            <button className="mini-action internet-row-action" type="button" title={internetEnabled ? "Check now" : "Internet monitoring is paused"} disabled={!internetEnabled || pending === `check-${monitor.id}`} onClick={() => onCheck(monitor.id)}>{ui.icon("play")}</button>
             <button className="mini-action danger internet-row-action" type="button" title="Delete monitor" onClick={() => onDelete(monitor)}>{ui.icon("trash")}</button>
           </div>
         </article>
@@ -254,7 +281,7 @@ function InternetPagination({ loading, page, pageCount, pageSize, total, count, 
   );
 }
 
-function InternetLatencyPanel({ monitor, samples, sampleRange, onRangeChange, loading, error, onCheck, actions, pending, ui }) {
+function InternetLatencyPanel({ monitor, samples, sampleRange, onRangeChange, loading, error, onCheck, pending, ui, internetEnabled }) {
   if (!monitor) {
     return (
       <section className="panel internet-latency-panel">
@@ -269,10 +296,9 @@ function InternetLatencyPanel({ monitor, samples, sampleRange, onRangeChange, lo
   return (
     <section className="panel internet-latency-panel">
       <div className="panel-head">
-        <div><h2>Latency History</h2><p>{monitor.name} · {monitor.config?.url || "-"}</p></div>
+        <div><h2>Latency History</h2><p>{monitor.name} - {monitor.config?.url || "-"}</p></div>
         <div className="panel-head-actions">
-          <button className="ghost-button" type="button" disabled={pending === `check-${monitor.id}`} onClick={() => onCheck(monitor.id)}>{ui.icon("play")} Check</button>
-          <button className="ghost-button" type="button" onClick={() => actions.setRoute({ view: "sensor-detail", sensorId: monitor.id })}>Open Detail</button>
+          <button className="ghost-button" type="button" disabled={!internetEnabled || pending === `check-${monitor.id}`} onClick={() => onCheck(monitor.id)}>{ui.icon("play")} Check</button>
         </div>
       </div>
       <div className="internet-latency-body">

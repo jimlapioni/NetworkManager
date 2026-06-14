@@ -4,6 +4,7 @@ import "../styles.css";
 import { apiRequest, authTokenStorageKey, emptySummary, normalizeList, normalizeSummary } from "./api.js";
 import { parseRouteHash, routeHash } from "./routing.js";
 import { InternetMonitorModal, InternetView, internetDeviceGroup, internetDeviceHost, internetDeviceName } from "./features/internet.jsx";
+import { NotificationChannelModal, NotificationsView } from "./features/notifications.jsx";
 
 const statusLabels = { up: "Up", warning: "Warning", down: "Critical", unknown: "Unknown", paused: "Paused" };
 const statusRank = ["down", "warning", "unknown", "paused", "up"];
@@ -12,6 +13,7 @@ const chartPlot = { left: 82, right: 744, top: 36, bottom: 268 };
 chartPlot.width = chartPlot.right - chartPlot.left;
 chartPlot.height = chartPlot.bottom - chartPlot.top;
 const chartTimeStepMs = 30 * 1000;
+const internetSettingsDefault = { enabled: true };
 const sampleRangeOptions = [
   ["1h", "1H"],
   ["24h", "1D"],
@@ -41,13 +43,14 @@ function icon(name) {
     trash: '<svg viewBox="0 0 24 24"><path d="M9 3h6l1 2h4v2H4V5h4l1-2Zm-3 6h12l-1 12H7L6 9Zm3 2v8h2v-8H9Zm4 0v8h2v-8h-2Z"/></svg>',
     close: '<svg viewBox="0 0 24 24"><path d="m6.4 5 5.6 5.6L17.6 5 19 6.4 13.4 12 19 17.6 17.6 19 12 13.4 6.4 19 5 17.6l5.6-5.6L5 6.4 6.4 5Z"/></svg>',
     radar: '<svg viewBox="0 0 24 24"><path d="M12 3a9 9 0 1 0 9 9h-2a7 7 0 1 1-7-7V3Zm1 1v9h7v-2h-4.2l4.8-4.8-1.4-1.4-4.8 4.8V4h-1.4Z"/></svg>',
+    bell: '<svg viewBox="0 0 24 24"><path d="M12 22a2.8 2.8 0 0 0 2.6-2h-5.2A2.8 2.8 0 0 0 12 22Zm7-5-2-2V9a5 5 0 0 0-4-4.9V2h-2v2.1A5 5 0 0 0 7 9v6l-2 2v1h14v-1Zm-4-1H9V9a3 3 0 0 1 6 0v7Z"/></svg>',
   };
   return <span dangerouslySetInnerHTML={{ __html: icons[name] || "" }} />;
 }
 
 function App() {
   const [route, setRouteState] = useState(() => parseRouteHash());
-  const [data, setData] = useState({ loading: true, apiOnline: false, summary: emptySummary, devices: [], groups: [], sensors: [], events: [], topologyLinks: [], discoveredNodes: [] });
+  const [data, setData] = useState({ loading: true, apiOnline: false, summary: emptySummary, internetSummary: emptySummary, devices: [], groups: [], sensors: [], events: [], topologyLinks: [], discoveredNodes: [], internetSettings: internetSettingsDefault });
   const [auth, setAuth] = useState({ loading: true, authenticated: false, setupRequired: false, authDisabled: false, user: null, error: "" });
   const [modal, setModal] = useState(null);
   const [deviceDetailTabs, setDeviceDetailTabs] = useState({});
@@ -82,7 +85,7 @@ function App() {
   const loadData = useCallback(async ({ showLoading = false } = {}) => {
     if (showLoading) setData((current) => ({ ...current, loading: true }));
     try {
-      const [summary, devices, groups, sensors, events, topologyLinks, discoveredNodes] = await Promise.all([
+      const [summary, devices, groups, sensors, events, topologyLinks, discoveredNodes, internetSettings, internetSensors] = await Promise.all([
         apiRequest("/api/summary"),
         apiRequest("/api/devices"),
         apiRequest("/api/groups"),
@@ -90,17 +93,21 @@ function App() {
         apiRequest("/api/events"),
         apiRequest("/api/topology/links"),
         apiRequest("/api/discovered-nodes"),
+        apiRequest("/api/internet/settings").catch(() => internetSettingsDefault),
+        apiRequest("/api/sensors?type=http&includeTotal=1&limit=1").catch(() => ({ summary: emptySummary, total: 0 })),
       ]);
       setData({
         loading: false,
         apiOnline: true,
         summary: normalizeSummary(summary),
+        internetSummary: normalizeSummary({ ...(internetSensors?.summary || {}), sensors: Number(internetSensors?.total || internetSensors?.summary?.total || 0) }),
         devices: normalizeList(devices),
         groups: normalizeList(groups),
         sensors: normalizeList(sensors),
         events: normalizeList(events),
         topologyLinks: normalizeList(topologyLinks),
         discoveredNodes: normalizeList(discoveredNodes),
+        internetSettings: { ...internetSettingsDefault, ...(internetSettings || {}) },
       });
     } catch (error) {
       setData((current) => ({ ...current, loading: false, apiOnline: false }));
@@ -143,10 +150,30 @@ function App() {
   const activeDeviceTab = deviceDetailTabs[String(selectedDevice?.id || "")] || (selectedPortSensors.length ? "ports" : "sensors");
   const localNetworkData = useMemo(() => buildLocalNetworkData(data), [data]);
   const headerSummary = route.view === "internet"
-    ? summarizeSensorStatuses(data.sensors.filter((sensor) => sensor.type === "http"))
+    ? data.internetSummary
     : route.view === "dashboard"
       ? localNetworkData.summary
     : data.summary;
+
+  useEffect(() => {
+    if (route.view !== "sensor-detail" || !route.sensorId || data.loading || !data.apiOnline) return undefined;
+    let cancelled = false;
+    if (selectedSensor?.type === "http") {
+      setRoute({ view: "internet", monitorId: selectedSensor.id });
+      return undefined;
+    }
+    if (selectedSensor) return undefined;
+    apiRequest("/api/sensors?type=http&includeTotal=1&limit=1000")
+      .then((payload) => {
+        if (cancelled) return;
+        const monitor = normalizeList(payload).find((item) => String(item.id) === String(route.sensorId));
+        if (monitor) setRoute({ view: "internet", monitorId: monitor.id });
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [route.view, route.sensorId, selectedSensor?.id, selectedSensor?.type, data.loading, data.apiOnline, setRoute]);
 
   const refreshPortSamples = useCallback(async (deviceId, { force = false } = {}) => {
     if (!deviceId) return;
@@ -241,7 +268,7 @@ function App() {
       }
       window.localStorage.removeItem(authTokenStorageKey);
       setAuth({ loading: false, authenticated: false, setupRequired: false, authDisabled: false, user: null, error: "" });
-      setData((current) => ({ ...current, apiOnline: false, devices: [], groups: [], sensors: [], events: [], topologyLinks: [], discoveredNodes: [], summary: emptySummary }));
+      setData((current) => ({ ...current, apiOnline: false, devices: [], groups: [], sensors: [], events: [], topologyLinks: [], discoveredNodes: [], summary: emptySummary, internetSummary: emptySummary, internetSettings: internetSettingsDefault }));
       setTopologyDiscovery(null);
     },
     setRoute,
@@ -253,7 +280,8 @@ function App() {
     saveDeviceGroup: (deviceId, payload) => runAction("save-device-group", () => apiRequest(`/api/devices/${deviceId}/group`, { method: "POST", body: payload })),
     saveSensor: (deviceId, payload) => runAction("save-sensor", () => apiRequest(`/api/devices/${deviceId}/sensors`, { method: "POST", body: payload })),
     saveInternetMonitor: (payload) => runAction("save-internet-monitor", async () => {
-      let device = data.devices.find((item) => item.name === internetDeviceName && item.host === internetDeviceHost);
+      const allDevices = normalizeList(await apiRequest("/api/devices?includeSystem=1&limit=1000"));
+      let device = allDevices.find((item) => item.name === internetDeviceName && item.host === internetDeviceHost);
       if (!device) {
         device = await apiRequest("/api/devices", {
           method: "POST",
@@ -275,6 +303,14 @@ function App() {
         },
       });
     }),
+    setInternetMonitoringEnabled: (enabled) => runAction("internet-settings", () => apiRequest("/api/internet/settings", { method: "PUT", body: { enabled } })),
+    saveNotificationChannel: (payload) => runAction("notification-channel", () => {
+      const channelId = payload?.id;
+      const body = { name: payload.name, type: payload.type, enabled: payload.enabled, config: payload.config || {} };
+      return apiRequest(channelId ? `/api/notification-channels/${channelId}` : "/api/notification-channels", { method: channelId ? "PATCH" : "POST", body });
+    }),
+    deleteNotificationChannel: (channel) => runAction(`notification-delete-${channel.id}`, () => apiRequest(`/api/notification-channels/${channel.id}`, { method: "DELETE" })),
+    testNotificationChannel: (channelId) => runAction(`notification-test-${channelId}`, () => apiRequest(`/api/notification-channels/${channelId}/test`, { method: "POST", body: {} })),
     createDiscoveredSensors: (deviceId, payload) => runAction("bulk-sensors", () => apiRequest(`/api/devices/${deviceId}/sensors/bulk`, { method: "POST", body: payload })),
     scanSnmp: (deviceId, payload) => apiRequest(`/api/devices/${deviceId}/snmp/walk`, { method: "POST", body: payload }),
     scanTraffic: (deviceId, payload) => apiRequest(`/api/devices/${deviceId}/interfaces/discover`, { method: "POST", body: payload }),
@@ -379,9 +415,10 @@ function App() {
 function CurrentView(props) {
   const ui = { StatusBadge, emptyState, formatDateTime, icon, metricCard };
   if (props.route.view === "internet") return <InternetView {...props} ui={ui} />;
-  if (props.route.view === "devices") return <DevicesView {...props} />;
-  if (props.route.view === "sensors") return <SensorsView {...props} />;
-  if (props.route.view === "events") return <EventsView events={props.data.events} />;
+  if (props.route.view === "notifications") return <NotificationsView {...props} ui={ui} />;
+  if (props.route.view === "devices") return <DevicesView {...props} data={props.localNetworkData || props.data} />;
+  if (props.route.view === "sensors") return <SensorsView {...props} data={props.localNetworkData || props.data} />;
+  if (props.route.view === "events") return <EventsView events={(props.localNetworkData || props.data).events} />;
   if (props.route.view === "device-detail") return <DeviceDetail {...props} />;
   if (props.route.view === "sensor-detail") {
     const key = String(props.route.sensorId || "");
@@ -426,7 +463,7 @@ function AuthScreen({ auth, setAuth, loadData }) {
 }
 
 function Header({ route, summary, apiOnline, auth, actions }) {
-  const titles = { dashboard: "Command Dashboard", internet: "Internet Monitoring", devices: "Device Inventory", sensors: "Sensor Console", events: "Alert Timeline", "device-detail": "Device Detail", "sensor-detail": "Sensor Detail" };
+  const titles = { dashboard: "Command Dashboard", internet: "Internet Monitoring", devices: "Device Inventory", sensors: "Sensor Console", events: "Alert Timeline", notifications: "Notifications", "device-detail": "Device Detail", "sensor-detail": "Sensor Detail" };
   return (
     <header className="topbar">
       <div><div className="eyebrow">Local Network Monitoring</div><h1>{titles[route.view] || titles.dashboard}</h1></div>
@@ -440,7 +477,7 @@ function Header({ route, summary, apiOnline, auth, actions }) {
         {auth?.user && <span className="user-chip">{auth.user.username}</span>}
         {!auth?.authDisabled && <button className="ghost-button" type="button" onClick={actions.logout}>Sign Out</button>}
         <button className="ghost-button" type="button" onClick={actions.refresh}>{icon("refresh")} Refresh</button>
-        <button className="primary-button" type="button" onClick={() => actions.openModal({ type: "device" })}>{icon("plus")} Device</button>
+        {!["internet", "notifications"].includes(route.view) && <button className="primary-button" type="button" onClick={() => actions.openModal({ type: "device" })}>{icon("plus")} Device</button>}
       </div>
     </header>
   );
@@ -458,6 +495,7 @@ function Sidebar({ data, route, actions }) {
         <NavButton active={route.view === "devices"} label="Devices" iconName="server" onClick={() => actions.setRoute({ view: "devices" })} />
         <NavButton active={route.view === "sensors"} label="Sensors" iconName="sensor" onClick={() => actions.setRoute({ view: "sensors" })} />
         <NavButton active={route.view === "events"} label="Alerts" iconName="alert" onClick={() => actions.setRoute({ view: "events" })} />
+        <NavButton active={route.view === "notifications"} label="Notifications" iconName="bell" onClick={() => actions.setRoute({ view: "notifications" })} />
       </nav>
       <section className="tree-panel">
         <div className="section-label"><span>Monitoring Tree</span><button className="mini-button" type="button" onClick={() => actions.openModal({ type: "group" })}>{icon("plus")}</button></div>
@@ -685,29 +723,45 @@ function PortGrid({ sensors, samples, actions }) {
 function SensorTable({ sensors, devices, actions, showDevice = true, pending }) {
   if (!sensors.length) return emptyState("No sensors", "Readings will appear after sensors are added.");
   const deviceName = (id) => devices.find((device) => String(device.id) === String(id))?.name || "-";
+  const topScrollRef = useRef(null);
+  const bodyScrollRef = useRef(null);
+  const tableWidth = showDevice ? 1440 : 1280;
+  function syncTopScroll(event) {
+    if (bodyScrollRef.current && bodyScrollRef.current.scrollLeft !== event.currentTarget.scrollLeft) {
+      bodyScrollRef.current.scrollLeft = event.currentTarget.scrollLeft;
+    }
+  }
+  function syncBodyScroll(event) {
+    if (topScrollRef.current && topScrollRef.current.scrollLeft !== event.currentTarget.scrollLeft) {
+      topScrollRef.current.scrollLeft = event.currentTarget.scrollLeft;
+    }
+  }
   return (
     <div className="scrollable-table-shell">
-      <table>
-        <thead><tr><th>Status</th><th>Sensor</th><th>Type</th>{showDevice && <th>Device</th>}<th>Value</th><th>Last Check</th><th>Actions</th></tr></thead>
-        <tbody>
-          {sensors.map((sensor) => (
-            <tr key={sensor.id} data-sensor-id={sensor.id} onClick={() => actions.setRoute({ view: "sensor-detail", sensorId: sensor.id })}>
-              <td><StatusBadge status={sensor.status} /></td>
-              <td><strong>{sensor.name}</strong>{sensor.type === "snmp_traffic" && sensor.config?.interfaceDescription && <small>{sensor.config.interfaceDescription}</small>}</td>
-              <td>{sensor.type}</td>
-              {showDevice && <td>{deviceName(sensor.deviceId)}</td>}
-              <td>{sensor.lastValue || "-"}</td>
-              <td>{sensor.lastCheck || "-"}</td>
-              <td>
-                <div className="row-actions">
-                  <button className="mini-action" type="button" disabled={pending === `check-${sensor.id}`} onClick={(event) => { event.stopPropagation(); actions.checkSensor(sensor.id); }}>{icon("play")} Check</button>
-                  <button className="mini-action danger" type="button" onClick={(event) => { event.stopPropagation(); actions.deleteSensor(sensor); }}>{icon("trash")} Delete</button>
-                </div>
-              </td>
-            </tr>
-          ))}
-        </tbody>
-      </table>
+      <div className="table-scroll-top" ref={topScrollRef} onScroll={syncTopScroll} aria-hidden="true"><div style={{ width: `${tableWidth}px` }} /></div>
+      <div className="data-table-wrap" ref={bodyScrollRef} onScroll={syncBodyScroll}>
+        <table className={`sensor-table ${showDevice ? "" : "compact-sensor-table"}`}>
+          <thead><tr><th className="sensor-col-status">Status</th><th className="sensor-col-name">Sensor</th><th className="sensor-col-type">Type</th>{showDevice && <th className="sensor-col-device">Device</th>}<th className="sensor-col-value">Value</th><th className="sensor-col-check">Last Check</th><th className="sensor-col-actions">Actions</th></tr></thead>
+          <tbody>
+            {sensors.map((sensor) => (
+              <tr key={sensor.id} data-sensor-id={sensor.id} onClick={() => actions.setRoute({ view: "sensor-detail", sensorId: sensor.id })}>
+                <td><StatusBadge status={sensor.status} /></td>
+                <td><div className="sensor-name-cell"><strong>{sensor.name}</strong>{sensor.type === "snmp_traffic" && sensor.config?.interfaceDescription && <small>{sensor.config.interfaceDescription}</small>}</div></td>
+                <td>{sensor.type}</td>
+                {showDevice && <td>{deviceName(sensor.deviceId)}</td>}
+                <td>{sensor.lastValue || "-"}</td>
+                <td>{sensor.lastCheck || "-"}</td>
+                <td>
+                  <div className="row-actions">
+                    <button className="mini-action" type="button" disabled={pending === `check-${sensor.id}`} onClick={(event) => { event.stopPropagation(); actions.checkSensor(sensor.id); }}>{icon("play")} Check</button>
+                    <button className="mini-action danger" type="button" onClick={(event) => { event.stopPropagation(); actions.deleteSensor(sensor); }}>{icon("trash")} Delete</button>
+                  </div>
+                </td>
+              </tr>
+            ))}
+          </tbody>
+        </table>
+      </div>
     </div>
   );
 }
@@ -939,6 +993,7 @@ function ModalHost({ modal, actions, data, pending }) {
   if (modal.type === "sensor") return <SensorModal device={device} actions={actions} />;
   if (modal.type === "traffic") return <TrafficModal device={device} sensors={data.sensors} actions={actions} />;
   if (modal.type === "internet-monitor") return <InternetMonitorModal actions={actions} ui={{ ModalShell, FormMessage, ModalActions }} />;
+  if (modal.type === "notification-channel") return <NotificationChannelModal actions={actions} pending={pending} ui={{ ModalShell, FormMessage, ModalActions }} channel={modal.channel} />;
   if (modal.type === "lldp-results") return <LldpDiscoveryModal modal={modal} devices={data.devices} discoveredNodes={data.discoveredNodes} actions={actions} pending={pending} />;
   return null;
 }
@@ -1321,8 +1376,10 @@ function SensorChart({ sensor, samples, sampleRange = "1h", onRangeChange, loadi
   const domain = chartDomain(samples);
   const visibleSamples = chartVisibleSamples(samples, domain);
   if (sensor.type === "snmp_traffic") {
-    const points = visibleSamples.map((sample) => ({ inBps: Number(sample.meta?.inBps || 0), outBps: Number(sample.meta?.outBps || 0) }));
-    const measuredMax = Math.max(0, ...points.flatMap((item) => [item.inBps, item.outBps]));
+    const points = visibleSamples.map((sample) => ({ inBps: nullableNumber(sample.meta?.inBps), outBps: nullableNumber(sample.meta?.outBps) }));
+    const trafficValues = points.flatMap((item) => [item.inBps, item.outBps]).filter(isFiniteNumber);
+    const measuredMax = Math.max(0, ...trafficValues);
+    const latestValidPoint = [...points].reverse().find((item) => isFiniteNumber(item.inBps) || isFiniteNumber(item.outBps));
     const interfaceSpeed = Number(sensor.config?.interfaceSpeed || visibleSamples.at(-1)?.meta?.interfaceSpeed || 0);
     const axisMax = trafficAxisMode === "auto_peak"
       ? niceAxisMax(measuredMax)
@@ -1332,10 +1389,11 @@ function SensorChart({ sensor, samples, sampleRange = "1h", onRangeChange, loadi
       index,
       sample,
       x: chartSampleX(sample, index, domain),
-      inBps: points[index]?.inBps || 0,
-      outBps: points[index]?.outBps || 0,
-      inY: chartY(points[index]?.inBps || 0, axisMax),
-      outY: chartY(points[index]?.outBps || 0, axisMax),
+      inBps: points[index]?.inBps,
+      outBps: points[index]?.outBps,
+      inY: isFiniteNumber(points[index]?.inBps) ? chartY(points[index].inBps, axisMax) : chartPlot.bottom,
+      outY: isFiniteNumber(points[index]?.outBps) ? chartY(points[index].outBps, axisMax) : chartPlot.bottom,
+      hasData: isFiniteNumber(points[index]?.inBps) || isFiniteNumber(points[index]?.outBps),
     }));
     return (
       <div className="traffic-chart">
@@ -1343,26 +1401,29 @@ function SensorChart({ sensor, samples, sampleRange = "1h", onRangeChange, loadi
           <ChartControlGroup label="Range"><div className="segmented-control history-range-toggle" aria-label="History range">{sampleRangeOptions.map(([value, label]) => <button className={sampleRange === value ? "active" : ""} key={value} type="button" onClick={() => onRangeChange?.(value)}>{label}</button>)}</div></ChartControlGroup>
           <ChartControlGroup label="Scale" align="right"><div className="segmented-control chart-axis-toggle" aria-label="Y axis display mode"><button className={trafficAxisMode === "port_speed" ? "active" : ""} type="button" onClick={() => setTrafficAxisMode("port_speed")}>Port Speed</button><button className={trafficAxisMode === "auto_peak" ? "active" : ""} type="button" onClick={() => setTrafficAxisMode("auto_peak")}>Auto Peak</button></div></ChartControlGroup>
         </div>
-        <div className="chart-stats"><div><span>Inbound</span><strong>{formatRate(points.at(-1)?.inBps || 0)}</strong></div><div><span>Outbound</span><strong>{formatRate(points.at(-1)?.outBps || 0)}</strong></div><div><span>Peak</span><strong>{formatRate(measuredMax)}</strong></div><div><span>Axis Max</span><strong>{formatRate(axisMax)}</strong></div></div>
+        <div className="chart-stats"><div><span>Inbound</span><strong>{formatNullableRate(latestValidPoint?.inBps)}</strong></div><div><span>Outbound</span><strong>{formatNullableRate(latestValidPoint?.outBps)}</strong></div><div><span>Peak</span><strong>{formatRate(measuredMax)}</strong></div><div><span>Axis Max</span><strong>{formatRate(axisMax)}</strong></div></div>
         <svg viewBox="0 0 780 330" role="img" aria-label="Interface traffic history" onMouseLeave={() => setHoverIndex(null)}>
           <ChartGrid max={axisMax} scale={scale} domain={domain} />
-          <polyline className="chart-line in" points={chartPoints(points.map((item) => item.inBps), axisMax, visibleSamples, domain)} />
-          <polyline className="chart-line out" points={chartPoints(points.map((item) => item.outBps), axisMax, visibleSamples, domain)} />
+          {chartLineSegments(points.map((item) => item.inBps), axisMax, visibleSamples, domain).map((segment, index) => <polyline className="chart-line in" key={`in-${index}`} points={segment} />)}
+          {chartLineSegments(points.map((item) => item.outBps), axisMax, visibleSamples, domain).map((segment, index) => <polyline className="chart-line out" key={`out-${index}`} points={segment} />)}
+          {!trafficValues.length ? <text className="chart-empty-label" x={(chartPlot.left + chartPlot.right) / 2} y={(chartPlot.top + chartPlot.bottom) / 2} textAnchor="middle">No numeric traffic samples in this range</text> : null}
           <ChartHoverLayer mode="traffic" items={hoverPoints} hoverIndex={hoverIndex} onHover={setHoverIndex} />
         </svg>
         <div className="chart-legend"><span><i className="legend-in" />Inbound</span><span><i className="legend-out" />Outbound</span></div>
       </div>
     );
   }
-  const values = visibleSamples.map((sample) => Number(sample.valueNumber || 0));
-  const max = Math.max(1, ...values);
+  const values = visibleSamples.map((sample) => nullableNumber(sample.valueNumber));
+  const numericValues = values.filter(isFiniteNumber);
+  const max = Math.max(1, ...numericValues);
   const scale = chartScale(max, "number", sensor.unit || "");
   const hoverPoints = visibleSamples.map((sample, index) => ({
     index,
     sample,
     x: chartSampleX(sample, index, domain),
-    value: values[index] || 0,
-    y: chartY(values[index] || 0, max),
+    value: values[index],
+    y: isFiniteNumber(values[index]) ? chartY(values[index], max) : chartPlot.bottom,
+    hasData: isFiniteNumber(values[index]),
   }));
   return (
     <div className="traffic-chart">
@@ -1370,7 +1431,8 @@ function SensorChart({ sensor, samples, sampleRange = "1h", onRangeChange, loadi
       <div className="chart-stats"><div><span>Current</span><strong>{visibleSamples.at(-1)?.valueText || "-"}</strong></div><div><span>Samples</span><strong>{visibleSamples.length}</strong></div><div><span>Peak</span><strong>{max.toLocaleString()}</strong></div><div><span>Axis Max</span><strong>{max.toLocaleString()}</strong></div></div>
       <svg viewBox="0 0 780 330" role="img" aria-label="Sensor sample history" onMouseLeave={() => setHoverIndex(null)}>
         <ChartGrid max={max} scale={scale} domain={domain} />
-        <polyline className="chart-line in" points={chartPoints(values, max, visibleSamples, domain)} />
+        {chartLineSegments(values, max, visibleSamples, domain).map((segment, index) => <polyline className="chart-line in" key={`value-${index}`} points={segment} />)}
+        {!numericValues.length ? <text className="chart-empty-label" x={(chartPlot.left + chartPlot.right) / 2} y={(chartPlot.top + chartPlot.bottom) / 2} textAnchor="middle">No numeric samples in this range</text> : null}
         <ChartHoverLayer mode="value" items={hoverPoints} hoverIndex={hoverIndex} onHover={setHoverIndex} />
       </svg>
     </div>
@@ -1381,6 +1443,9 @@ function ChartHoverLayer({ mode, items, hoverIndex, onHover }) {
   const hover = items.find((item) => item.index === hoverIndex);
   return (
     <>
+      <g className="chart-sample-markers">
+        {items.filter((item) => !item.hasData).map((item) => <circle key={`missing-${item.index}`} className={`chart-missing-point ${item.sample?.status || "unknown"}`} cx={item.x} cy={chartPlot.bottom - 5} r="3.5" />)}
+      </g>
       {hover ? <ChartTooltip mode={mode} item={hover} /> : null}
       <g className="chart-hover-targets">
         {items.map((item) => <line key={item.index} className="chart-hover-target" x1={item.x} x2={item.x} y1={chartPlot.top} y2={chartPlot.bottom} onMouseEnter={() => onHover(item.index)} onMouseMove={() => onHover(item.index)} />)}
@@ -1394,7 +1459,8 @@ function ChartTooltip({ mode, item }) {
   const markerYs = isTraffic ? [item.inY, item.outY] : [item.y];
   const anchorY = Math.min(...markerYs);
   const width = isTraffic ? 188 : 166;
-  const height = isTraffic ? (item.sample?.meta?.rollup ? 84 : 70) : (item.sample?.meta?.rollup ? 72 : 58);
+  const issueText = item.hasData ? "" : sampleIssueText(item.sample);
+  const height = isTraffic ? (item.sample?.meta?.rollup || issueText ? 88 : 70) : (item.sample?.meta?.rollup || issueText ? 76 : 58);
   const x = clampChartValue(item.x + 12, chartPlot.left + 8, chartPlot.right - width - 8);
   const y = clampChartValue(anchorY - height - 12, chartPlot.top + 8, chartPlot.bottom - height - 8);
   const rollup = item.sample?.meta?.rollup;
@@ -1404,20 +1470,21 @@ function ChartTooltip({ mode, item }) {
       <line className="chart-hover-line" x1={item.x} x2={item.x} y1={chartPlot.top} y2={chartPlot.bottom} />
       {isTraffic ? (
         <>
-          <circle className="chart-hover-point in" cx={item.x} cy={item.inY} r="4" />
-          <circle className="chart-hover-point out" cx={item.x} cy={item.outY} r="4" />
+          {isFiniteNumber(item.inBps) ? <circle className="chart-hover-point in" cx={item.x} cy={item.inY} r="4" /> : null}
+          {isFiniteNumber(item.outBps) ? <circle className="chart-hover-point out" cx={item.x} cy={item.outY} r="4" /> : null}
         </>
-      ) : <circle className="chart-hover-point in" cx={item.x} cy={item.y} r="4" />}
+      ) : item.hasData ? <circle className="chart-hover-point in" cx={item.x} cy={item.y} r="4" /> : null}
       <g className="chart-tooltip" transform={`translate(${x}, ${y})`}>
         <rect width={width} height={height} rx="7" />
         <text className="chart-tooltip-time" x="10" y="18">{formatDateTime(item.sample?.createdAt)}</text>
         {isTraffic ? (
           <>
-            <text className="chart-tooltip-row" x="10" y="40"><tspan className="chart-tooltip-in">Inbound</tspan><tspan x="82">{formatRate(item.inBps)}</tspan></text>
-            <text className="chart-tooltip-row" x="10" y="58"><tspan className="chart-tooltip-out">Outbound</tspan><tspan x="82">{formatRate(item.outBps)}</tspan></text>
+            <text className="chart-tooltip-row" x="10" y="40"><tspan className="chart-tooltip-in">Inbound</tspan><tspan x="82">{formatNullableRate(item.inBps)}</tspan></text>
+            <text className="chart-tooltip-row" x="10" y="58"><tspan className="chart-tooltip-out">Outbound</tspan><tspan x="82">{formatNullableRate(item.outBps)}</tspan></text>
           </>
-        ) : <text className="chart-tooltip-row" x="10" y="40"><tspan>Value</tspan><tspan x="62">{item.sample?.valueText || item.value.toLocaleString()}</tspan></text>}
-        {rollup ? <text className="chart-tooltip-meta" x="10" y={isTraffic ? 76 : 58}>{rollup} rollup{sampleCount ? `, ${sampleCount} samples` : ""}</text> : null}
+        ) : <text className="chart-tooltip-row" x="10" y="40"><tspan>Value</tspan><tspan x="62">{item.hasData ? (item.sample?.valueText || item.value.toLocaleString()) : "-"}</tspan></text>}
+        {issueText ? <text className="chart-tooltip-meta" x="10" y={isTraffic ? 76 : 58}>{issueText}</text> : null}
+        {rollup ? <text className="chart-tooltip-meta" x="10" y={issueText ? (isTraffic ? 84 : 68) : (isTraffic ? 76 : 58)}>{rollup} rollup{sampleCount ? `, ${sampleCount} samples` : ""}</text> : null}
       </g>
     </g>
   );
@@ -1670,6 +1737,23 @@ function chartPoints(values, max, samples, domain) {
   }).join(" ");
 }
 
+function chartLineSegments(values, max, samples, domain) {
+  const segments = [];
+  let segment = [];
+  values.forEach((value, index) => {
+    if (!isFiniteNumber(value)) {
+      if (segment.length >= 2) segments.push(segment.join(" "));
+      segment = [];
+      return;
+    }
+    const x = chartSampleX(samples[index], index, domain);
+    const y = chartY(value, max);
+    segment.push(`${x.toFixed(1)},${y.toFixed(1)}`);
+  });
+  if (segment.length >= 2) segments.push(segment.join(" "));
+  return segments;
+}
+
 function chartSampleX(sample, index, domain) {
   const time = new Date(sample?.createdAt || "").getTime();
   return chartX(Number.isFinite(time) ? time : domain.start + index * chartTimeStepMs, domain);
@@ -1750,6 +1834,16 @@ function niceAxisMax(value) {
   return step * base;
 }
 
+function nullableNumber(value) {
+  if (value === null || value === undefined || value === "") return null;
+  const number = Number(value);
+  return Number.isFinite(number) ? number : null;
+}
+
+function isFiniteNumber(value) {
+  return typeof value === "number" && Number.isFinite(value);
+}
+
 function formatRate(value) {
   let current = Number(value || 0);
   const units = ["bps", "Kbps", "Mbps", "Gbps", "Tbps"];
@@ -1759,6 +1853,18 @@ function formatRate(value) {
     unit = units[index + 1];
   }
   return `${current.toFixed(2)} ${unit}`;
+}
+
+function formatNullableRate(value) {
+  return isFiniteNumber(value) ? formatRate(value) : "-";
+}
+
+function sampleIssueText(sample) {
+  const status = statusLabels[sample?.status] || "No data";
+  const value = String(sample?.valueText || "").trim();
+  const text = value && value !== "-" ? value : "No numeric data";
+  const message = `${status}: ${text}`;
+  return message.length > 36 ? `${message.slice(0, 33)}...` : message;
 }
 
 function shortInterfaceName(value) {
